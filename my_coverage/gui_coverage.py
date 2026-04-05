@@ -1,4 +1,13 @@
-import math
+"""
+gui_coverage.py  –  Coverage action backend
+my_coverage | ROS 2
+
+Subscribes to /user_selected_field (Polygon) and sends it to the
+navigate_complete_coverage action server.
+Also subscribes to /cancel_coverage (Empty) to cancel the active goal.
+Publishes status on /coverage_task_status (String).
+"""
+
 from enum import Enum
 
 from action_msgs.msg import GoalStatus
@@ -7,7 +16,7 @@ from opennav_coverage_msgs.action import NavigateCompleteCoverage
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Empty, String
 from visualization_msgs.msg import Marker
 
 
@@ -38,6 +47,11 @@ class GuiCoverage(Node):
         self.field_sub = self.create_subscription(
             Polygon, '/user_selected_field', self.field_callback, 10
         )
+        # Cancel subscription — the GUI drawer publishes here when the
+        # "Cancel Cleaning" button is pressed.
+        self.cancel_sub = self.create_subscription(
+            Empty, '/cancel_coverage', self._cancel_callback, 10
+        )
         self.marker_pub = self.create_publisher(
             Marker, '/user_selected_field_marker', 10
         )
@@ -51,28 +65,42 @@ class GuiCoverage(Node):
         self.coverage_client.destroy()
         super().destroy_node()
 
-    def field_callback(self, msg):
-        field = [[pt.x, pt.y] for pt in msg.points]
-        if len(field) < 4:
-            self._publish_status('FAILED: polygon needs at least 3 corners')
-            self.get_logger().error('Polygon needs at least 3 corners')
-            return
+    # ── polygon reception ─────────────────────────────────────────────────── #
 
-        if field[0] != field[-1]:
+    def field_callback(self, msg):
+        """
+        Accept a closed polygon with ≥ 3 unique corners.
+        The polygon sent by polygon_drawer is already closed (first point
+        repeated at the end), so a 3-corner room arrives as 4 points.
+        Convexity is NOT enforced — opennav_coverage handles arbitrary shapes.
+        """
+        field = [[pt.x, pt.y] for pt in msg.points]
+
+        # Ensure the polygon is closed
+        if len(field) >= 2 and field[0] != field[-1]:
             field.append(field[0])
 
-        if not self.is_convex(field[:-1]):
-            self._publish_status('FAILED: polygon must be convex')
-            self.get_logger().error('Polygon is not convex')
+        unique_corners = len(field) - 1
+        if unique_corners < 3:
+            self._publish_status(
+                f'FAILED: polygon needs at least 3 corners (got {unique_corners})'
+            )
+            self.get_logger().error(
+                f'Polygon rejected: need >= 3 corners, received {unique_corners}'
+            )
             return
 
-        self.pending_fields.append(field)
         self.get_logger().info(
-            f'Queued polygon with {len(field) - 1} corners, queue size: {len(self.pending_fields)}'
+            f'Accepted polygon with {unique_corners} corners; '
+            f'queue size: {len(self.pending_fields)}'
         )
+
+        self.pending_fields.append(field)
         self.publish_polygon_marker(field)
         if not self.is_processing:
             self.process_next_field()
+
+    # ── goal processing ───────────────────────────────────────────────────── #
 
     def process_next_field(self):
         if not self.pending_fields:
@@ -100,13 +128,12 @@ class GuiCoverage(Node):
 
         self._publish_status('Running coverage')
         self.get_logger().info(
-            f'Sending coverage goal with {len(field) - 1} corners in frame '
-            f'{goal_msg.frame_id}'
+            f'Sending coverage goal: {len(field) - 1} corners in frame {goal_msg.frame_id}'
         )
-        send_goal_future = self.coverage_client.send_goal_async(
+        send_future = self.coverage_client.send_goal_async(
             goal_msg, self.feedback_callback
         )
-        send_goal_future.add_done_callback(self.goal_response_callback)
+        send_future.add_done_callback(self.goal_response_callback)
 
     def goal_response_callback(self, future):
         try:
@@ -119,7 +146,7 @@ class GuiCoverage(Node):
             return
 
         if not self.goal_handle.accepted:
-            self.get_logger().error('Coverage goal rejected')
+            self.get_logger().error('Coverage goal rejected by action server')
             self._publish_status('FAILED: goal rejected')
             self.is_processing = False
             self.process_next_field()
@@ -154,6 +181,36 @@ class GuiCoverage(Node):
         self.reset_state()
         self.process_next_field()
 
+    # ── cancel ────────────────────────────────────────────────────────────── #
+
+    def _cancel_callback(self, _msg):
+        """Called when /cancel_coverage (Empty) is received from the GUI."""
+        if self.goal_handle is None:
+            self.get_logger().warn('Cancel requested but no active coverage goal')
+            self._publish_status('No active task to cancel')
+            return
+
+        self.get_logger().info('Cancel request received — cancelling coverage goal')
+        self._publish_status('Cancelling...')
+
+        cancel_future = self.goal_handle.cancel_goal_async()
+        cancel_future.add_done_callback(self._cancel_done_callback)
+
+    def _cancel_done_callback(self, future):
+        try:
+            response = future.result()
+            # return_code 0 = ERROR_NONE (accepted)
+            if response.return_code == 0:
+                self.get_logger().info('Cancel request accepted by action server')
+            else:
+                self.get_logger().warn(
+                    f'Cancel request returned code {response.return_code}'
+                )
+        except Exception as error:
+            self.get_logger().error(f'Cancel request failed: {error}')
+
+    # ── helpers ───────────────────────────────────────────────────────────── #
+
     def reset_state(self):
         self.goal_handle = None
         self.result_future = None
@@ -167,10 +224,10 @@ class GuiCoverage(Node):
     def to_polygon(self, field):
         polygon = Polygon()
         for x_value, y_value in field:
-            point = Point32()
-            point.x = float(x_value)
-            point.y = float(y_value)
-            polygon.points.append(point)
+            pt = Point32()
+            pt.x = float(x_value)
+            pt.y = float(y_value)
+            polygon.points.append(pt)
         return polygon
 
     def publish_polygon_marker(self, field):
@@ -183,15 +240,15 @@ class GuiCoverage(Node):
         marker.action = Marker.ADD
         marker.scale.x = 0.05
         marker.color.r = 0.0
-        marker.color.g = 1.0
-        marker.color.b = 0.0
+        marker.color.g = 0.47
+        marker.color.b = 0.84
         marker.color.a = 1.0
         for x_value, y_value in field:
-            point = Point()
-            point.x = float(x_value)
-            point.y = float(y_value)
-            point.z = 0.0
-            marker.points.append(point)
+            pt = Point()
+            pt.x = float(x_value)
+            pt.y = float(y_value)
+            pt.z = 0.0
+            marker.points.append(pt)
         self.marker_pub.publish(marker)
 
     def _publish_status(self, text):
@@ -207,32 +264,6 @@ class GuiCoverage(Node):
         if self.status == GoalStatus.STATUS_CANCELED:
             return TaskResult.CANCELED
         return TaskResult.UNKNOWN
-
-    def is_convex(self, field):
-        if len(field) < 3:
-            return False
-
-        def cross_product(p1, p2, p3):
-            return (
-                (p2[0] - p1[0]) * (p3[1] - p1[1])
-                - (p2[1] - p1[1]) * (p3[0] - p1[0])
-            )
-
-        sign = 0
-        count = len(field)
-        for index in range(count):
-            p1 = field[index]
-            p2 = field[(index + 1) % count]
-            p3 = field[(index + 2) % count]
-            cross = cross_product(p1, p2, p3)
-            if math.isclose(cross, 0.0):
-                continue
-            current_sign = 1 if cross > 0 else -1
-            if sign == 0:
-                sign = current_sign
-            elif sign != current_sign:
-                return False
-        return True
 
 
 def main():
