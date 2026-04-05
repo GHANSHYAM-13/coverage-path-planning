@@ -1,0 +1,5 @@
+coverage_executor:
+  ros__parameters:
+    bt_navigator_name: "bt_navigator"
+    frame_id: "map"
+    polygon: []

@@ -1,0 +1,25 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RateController hz="1.0">
+      <Sequence name="NavigateWithReplanning">
+        <ComputeCoveragePath nav_path="{path}" polygons="{field_polygon}" polygons_frame_id="{polygon_frame_id}"/>
+
+        <GetPoseFromPath path="{path}" pose="{start_pose}" index="0" />
+        <ComputePathToPose goal="{start_pose}" path="{path_to_start}" planner_id="GridBased2"/>
+        <FollowPath path="{path_to_start}" controller_id="FollowPath"/>
+
+        <RecoveryNode number_of_retries="100">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <RoundRobin>
+            <FollowPath path="{path}" controller_id="FollowPath"/>
+            <Sequence>
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Wait wait_duration="1.0"/>
+          </RoundRobin>
+        </RecoveryNode>
+      </Sequence>
+    </RateController>
+  </BehaviorTree>
+</root>

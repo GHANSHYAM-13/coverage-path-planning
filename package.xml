@@ -1,0 +1,40 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>my_coverage</name>
+  <version>1.0.0</version>
+  <description>Reusable OpenNav coverage-server package for cleaning robots.</description>
+  <maintainer email="jd@example.com">jd</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>lifecycle_msgs</depend>
+  <depend>nav2_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>visualization_msgs</depend>
+
+  <depend>nav2_bringup</depend>
+  <depend>nav2_map_server</depend>
+  <depend>nav2_amcl</depend>
+  <depend>nav2_controller</depend>
+  <depend>nav2_planner</depend>
+  <depend>nav2_behaviors</depend>
+  <depend>nav2_smoother</depend>
+  <depend>nav2_velocity_smoother</depend>
+  <depend>nav2_lifecycle_manager</depend>
+
+  <depend>opennav_coverage</depend>
+  <depend>opennav_row_coverage</depend>
+  <depend>opennav_coverage_msgs</depend>
+  <depend>opennav_coverage_bt</depend>
+  <depend>opennav_coverage_navigator</depend>
+  <depend>backported_bt_navigator</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
