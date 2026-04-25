@@ -21,7 +21,7 @@ import queue
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 
 # Optional PIL for smooth image scaling (pip install Pillow)
 try:
@@ -37,6 +37,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from std_msgs.msg import Empty, String, Float32
 from visualization_msgs.msg import Marker
+import yaml
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,6 +210,67 @@ class PolygonDrawer(Node):
         self.marker_pub = self.create_publisher(
             Marker, "/user_selected_field_marker", 10
         )
+        
+        # Section management
+        self.sections = {}  # dict: {section_name: [[x1, y1], [x2, y2], ...]}
+        self.sections_file = os.path.expanduser("~/.ros/coverage_sections.yaml")
+        self.load_sections()
+
+    # ── section management ─────────────────────────────────────────────────── #
+    
+    def get_sections_file(self):
+        """Get path to sections storage file."""
+        os.makedirs(os.path.dirname(self.sections_file), exist_ok=True)
+        return self.sections_file
+    
+    def load_sections(self):
+        """Load saved sections from YAML file."""
+        sections_file = self.get_sections_file()
+        if os.path.exists(sections_file):
+            try:
+                with open(sections_file, 'r') as f:
+                    data = yaml.safe_load(f)
+                    self.sections = data.get('sections', {}) if data else {}
+                    self.get_logger().info(f"Loaded {len(self.sections)} saved sections")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load sections: {e}")
+                self.sections = {}
+        else:
+            self.sections = {}
+    
+    def save_section(self, section_name, field):
+        """Save a polygon as a named section."""
+        # Ensure polygon is closed
+        if len(field) >= 2 and field[0] != field[-1]:
+            field = list(field) + [field[0]]
+        
+        self.sections[section_name] = field
+        self._persist_sections()
+        self.get_logger().info(f"Saved section: {section_name}")
+        return section_name
+    
+    def delete_section(self, section_name):
+        """Delete a saved section."""
+        if section_name in self.sections:
+            del self.sections[section_name]
+            self._persist_sections()
+            self.get_logger().info(f"Deleted section: {section_name}")
+            return True
+        return False
+    
+    def get_section(self, section_name):
+        """Get a saved section by name."""
+        return self.sections.get(section_name)
+    
+    def _persist_sections(self):
+        """Write sections to YAML file."""
+        try:
+            sections_file = self.get_sections_file()
+            data = {'sections': self.sections}
+            with open(sections_file, 'w') as f:
+                yaml.dump(data, f, default_flow_style=False)
+        except Exception as e:
+            self.get_logger().error(f"Failed to save sections: {e}")
 
     # ── map YAML parser ───────────────────────────────────────────────────── #
 
@@ -361,6 +423,32 @@ class PolygonDrawer(Node):
             "local_status",
             ("warning", "Cancel request sent to coverage server"),
         ))
+
+    def save_current_area(self, section_name):
+        """Save current drawn area as a named section."""
+        if not section_name or not section_name.strip():
+            self.ui_queue.put((
+                "popup",
+                "Enter a valid section name (e.g., 'Kitchen', 'Living Room')",
+            ))
+            return False
+        
+        pts = self.get_pts()
+        if len(pts) < 3:
+            self.ui_queue.put((
+                "popup",
+                "Select at least 3 corners before saving.",
+            ))
+            return False
+        
+        map_pts = [self._c2m(p) for p in pts]
+        self.save_section(section_name, map_pts)
+        self.ui_queue.put((
+            "local_status",
+            ("success", f"Section '{section_name}' saved successfully"),
+        ))
+        self.ui_queue.put(("sections_updated", None))
+        return True
 
     # ── coordinate conversion ─────────────────────────────────────────────── #
 
@@ -857,6 +945,120 @@ def main():
     btn_cancel = make_btn(ctrl, "Cancel Cleaning",   node.cancel_coverage,      style="cancel")
     btn_cancel.pack(fill="x", pady=3)
 
+    # ── SECTION MANAGEMENT section ────────────────────────────────────────── #
+    section_hdr(right, "Section Management")
+
+    # Save section row with input
+    save_sec_row = tm.reg(tk.Frame(right), bg="panel")
+    save_sec_row.pack(fill="x", padx=10, pady=(4, 2))
+    
+    section_name_var = tk.StringVar()
+    section_name_entry = tm.reg(
+        tk.Entry(
+            save_sec_row,
+            textvariable=section_name_var,
+            font=F_SMALL,
+            width=15,
+        ),
+        bg="lb_bg", fg="text",
+    )
+    section_name_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+    
+    def save_section_action():
+        name = section_name_var.get().strip()
+        if node.save_current_area(name):
+            section_name_var.set("")
+            section_name_entry.delete(0, tk.END)
+            refresh_saved_sections()
+    
+    btn_save_sec = make_btn(save_sec_row, "Save Section", save_section_action, style="primary")
+    btn_save_sec.pack(side="right")
+
+    # ── SAVED SECTIONS list ──────────────────────────────────────────────── #
+    section_hdr(right, "Saved Sections")
+
+    # Listbox with saved sections
+    list_wrap_sec = tm.reg(tk.Frame(right), bg="panel")
+    list_wrap_sec.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+    list_sb_sec = tk.Scrollbar(list_wrap_sec)
+    tm.reg(list_sb_sec, bg="panel", troughcolor="bg", activebackground="border_lt")
+    list_sb_sec.pack(side="right", fill="y")
+
+    saved_sections_listbox = tk.Listbox(
+        list_wrap_sec,
+        font=F_SMALL,
+        activestyle="none",
+        bd=0, relief="flat",
+        highlightthickness=0,
+        yscrollcommand=list_sb_sec.set,
+        selectmode=tk.MULTIPLE,  # Allow multiple selection
+    )
+    tm.reg(saved_sections_listbox,
+           bg="lb_bg", fg="text2",
+           selectbackground="lb_sel_bg",
+           selectforeground="lb_sel_fg")
+    saved_sections_listbox.pack(side="left", fill="both", expand=True)
+    list_sb_sec.config(command=saved_sections_listbox.yview)
+
+    def refresh_saved_sections():
+        """Refresh the saved sections listbox."""
+        saved_sections_listbox.delete(0, tk.END)
+        T = tm.T
+        for idx, section_name in enumerate(sorted(node.sections.keys())):
+            saved_sections_listbox.insert(tk.END, f"  {section_name}")
+            if idx % 2 == 0:
+                saved_sections_listbox.itemconfig(idx, bg=T["lb_alt"])
+
+    # Buttons for section actions
+    sec_btn_row = tm.reg(tk.Frame(right), bg="panel")
+    sec_btn_row.pack(fill="x", padx=10, pady=(2, 8))
+
+    def clean_selected_sections():
+        """Clean selected sections."""
+        selection = saved_sections_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select at least one section")
+            return
+        
+        sections_list = sorted(node.sections.keys())
+        selected_names = [sections_list[i] for i in selection]
+        
+        # For now, clean the first selected section
+        # In future, could add support for multiple sequential sections
+        first_section = selected_names[0]
+        section_polygon = node.get_section(first_section)
+        
+        if section_polygon:
+            node.set_pts([node.map_to_canvas(x, y) for x, y in section_polygon])
+            node.ui_queue.put(("refresh", None))
+            node.send_polygon()
+            set_status("info", f"Cleaning section: {first_section}")
+
+    def delete_selected_section():
+        """Delete selected section."""
+        selection = saved_sections_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a section to delete")
+            return
+        
+        sections_list = sorted(node.sections.keys())
+        section_name = sections_list[selection[0]]
+        
+        if messagebox.askyesno("Confirm Delete", f"Delete section '{section_name}'?"):
+            node.delete_section(section_name)
+            refresh_saved_sections()
+            set_status("info", f"Deleted section: {section_name}")
+
+    btn_clean_sec = make_btn(sec_btn_row, "Clean Selected", clean_selected_sections, style="primary")
+    btn_clean_sec.pack(side="left", fill="x", expand=True, padx=(0, 3))
+
+    btn_del_sec = make_btn(sec_btn_row, "Delete", delete_selected_section, style="danger")
+    btn_del_sec.pack(side="left", fill="x", expand=True)
+
+    # Initial load of saved sections
+    refresh_saved_sections()
+
     # ── MAP INFO section ──────────────────────────────────────────────────── #
     section_hdr(right, "Map Info")
 
@@ -1268,6 +1470,9 @@ def main():
                 for item_id in node.swath_canvas_ids:
                     canvas.delete(item_id)
                 node.swath_canvas_ids.clear()
+            elif evt == "sections_updated":
+                # Refresh saved sections listbox
+                refresh_saved_sections()
             elif evt == "popup":
                 messagebox.showwarning("Coverage Area Selector", data)
         root.after(100, pump)
