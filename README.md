@@ -72,8 +72,8 @@ This is the **most critical dependency**. Clone these packages into your workspa
 ```bash
 cd ~/cleanbot_ws/src
 
-# Clone the OpenNav coverage packages
-git clone https://github.com/open-navigation/opennav_coverage.git
+# Clone the OpenNav coverage packages (Humble branch)
+git clone --branch humble https://github.com/open-navigation/opennav_coverage.git
 
 # This will provide:
 # - opennav_coverage
@@ -84,12 +84,31 @@ git clone https://github.com/open-navigation/opennav_coverage.git
 # - backported_bt_navigator
 ```
 
+> **Note:** Branch specification (`--branch humble`) ensures compatibility with ROS 2 Humble. For other ROS 2 distributions, use the appropriate branch name (e.g., `iron`, `jazzy`, `rolling`).
+
 Alternative (if using a workspace with opennav already):
 ```bash
 sudo apt-get install -y ros-<distro>-opennav-coverage
 ```
 
 > **Note:** The `opennav_coverage` package is essential for coverage path planning. Without it, the coverage navigation will not work.
+
+#### Fields2Cover (Optional but Recommended)
+
+For advanced coverage planning and field decomposition:
+
+```bash
+cd ~/cleanbot_ws/src
+git clone https://github.com/Fields2Cover/Fields2Cover.git
+```
+
+Fields2Cover provides:
+- Field boundary decomposition algorithms
+- Optimal swath generation
+- Headland management for field coverage
+- Integration with opennav_coverage for custom planning strategies
+
+> **Note:** Fields2Cover is optional for basic coverage tasks but highly recommended for agricultural and large-scale coverage applications.
 
 #### Standard Message/Service Types
 ```bash
@@ -127,35 +146,50 @@ pip install Pillow PyQt5
    git clone <this-repo-url> my_coverage
    ```
 
-2. **Clone OpenNav coverage packages:**
+2. **Clone OpenNav coverage packages (Humble branch):**
    ```bash
    cd ~/cleanbot_ws/src
-   git clone https://github.com/open-navigation/opennav_coverage.git
+   git clone --branch humble https://github.com/open-navigation/opennav_coverage.git
    ```
 
-3. **Install system dependencies:**
+3. **Clone Fields2Cover (optional):**
+   ```bash
+   cd ~/cleanbot_ws/src
+   git clone https://github.com/Fields2Cover/Fields2Cover.git
+   ```
+   > Skip this if you only need basic coverage. Include it for advanced planning features.
+
+4. **Install system dependencies:**
    ```bash
    cd ~/cleanbot_ws
    rosdep install --from-paths src --ignore-src -r -y --continue-on-error
    ```
    > **Note:** You may see errors about `nav2_ros_common` or similar packages — these are expected and safe to ignore. The `--continue-on-error` flag allows rosdep to skip unresolvable dependencies. The packages will be built from source instead.
 
-4. **Install Python dependencies:**
+5. **Install Python dependencies:**
    ```bash
    pip install Pillow
    ```
 
-5. **Build the packages:**
+6. **Build the packages:**
    ```bash
    cd ~/cleanbot_ws
+   # Build opennav_coverage and my_coverage (optional: add Fields2Cover if cloned)
    colcon build --packages-select my_coverage opennav_coverage
    source install/setup.bash
    ```
 
-6. **Verify installation:**
+   To include Fields2Cover in the build:
+   ```bash
+   colcon build --packages-select my_coverage opennav_coverage Fields2Cover
+   source install/setup.bash
+   ```
+
+7. **Verify installation:**
    ```bash
    ros2 pkg list | grep my_coverage
    ros2 pkg list | grep opennav_coverage
+   ros2 pkg list | grep Fields2Cover  # Optional, only if cloned
    ```
 
 ### Dependency Summary Table
@@ -177,6 +211,7 @@ pip install Pillow PyQt5
 | **nav2_smoother** | ROS 2 | apt | Path smoothing |
 | **nav2_velocity_smoother** | ROS 2 | apt | Velocity profile smoothing |
 | **nav2_lifecycle_manager** | ROS 2 | apt | Lifecycle node management |
+| **Fields2Cover** | C++ Library | GitHub (Fields2Cover/Fields2Cover) | Optional: Advanced field decomposition and swath planning |
 | **Pillow** | Python | pip | Optional: image processing for GUI |
 
 ### Troubleshooting Installation
@@ -244,9 +279,37 @@ Different ROS 2 distributions (Humble, Iron, Jazzy) may have varying dependency 
 # Check your ROS 2 distribution
 echo $ROS_DISTRO
 
-# For older/newer distributions, you may need to build opennav_coverage from source
+# Clone opennav_coverage with the correct branch for your distribution:
+cd ~/cleanbot_ws/src
+git clone --branch $ROS_DISTRO https://github.com/open-navigation/opennav_coverage.git
+
+# Available branches: humble, iron, jazzy, rolling, master
+# For older/newer distributions, you may need to build from source
 # or use Docker for consistency. See the opennav_coverage repository for version compatibility.
 ```
+
+**Issue:** `fatal: Remote branch <distro> not found` when cloning opennav_coverage
+
+```bash
+# Solution: The branch you specified doesn't exist. Check available branches:
+cd ~/cleanbot_ws/src
+git ls-remote --heads https://github.com/open-navigation/opennav_coverage.git | grep -oE 'refs/heads/\K[^ ]+'
+
+# Clone with the appropriate branch (e.g., humble, iron, jazzy):
+git clone --branch humble https://github.com/open-navigation/opennav_coverage.git
+```
+
+**Issue:** Fields2Cover build fails with CMake errors
+
+```bash
+# Solution: Fields2Cover requires additional system dependencies (GDAL, boost, etc.)
+# Install all build dependencies and rebuild:
+sudo apt-get install -y gdal-bin libgdal-dev libboost-all-dev cmake build-essential
+cd ~/cleanbot_ws
+colcon build --packages-select Fields2Cover
+```
+
+If you don't need Fields2Cover's advanced features, you can skip it entirely for basic coverage tasks.
 
 ---
 
