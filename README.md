@@ -39,6 +39,8 @@ This package does not implement its own zigzag planner.
 
 ## Installation & Dependencies
 
+> **⚠️ Cross-System Note:** Different machines and ROS 2 distributions may have varying dependency availability. If `rosdep install` reports unresolvable packages like `nav2_ros_common`, this is normal. See the [Troubleshooting Installation](#troubleshooting-installation) section below for solutions. The recommended approach is to **build everything from source** using `colcon build`.
+
 ### System Requirements
 
 - **ROS 2** (Humble or later recommended)
@@ -134,8 +136,9 @@ pip install Pillow PyQt5
 3. **Install system dependencies:**
    ```bash
    cd ~/cleanbot_ws
-   rosdep install --from-paths src --ignore-src -r -y
+   rosdep install --from-paths src --ignore-src -r -y --continue-on-error
    ```
+   > **Note:** You may see errors about `nav2_ros_common` or similar packages — these are expected and safe to ignore. The `--continue-on-error` flag allows rosdep to skip unresolvable dependencies. The packages will be built from source instead.
 
 4. **Install Python dependencies:**
    ```bash
@@ -178,24 +181,71 @@ pip install Pillow PyQt5
 
 ### Troubleshooting Installation
 
+**Issue:** rosdep returns errors like `Cannot locate rosdep definition for [nav2_ros_common]` or `[nav2_minimal_tb3_sim]`
+
+This is normal and expected on many systems. These packages don't have universal rosdep definitions.
+
+```bash
+# Solution: Use the --continue-on-error flag to skip unresolvable dependencies
+rosdep install --from-paths src --ignore-src -r -y --continue-on-error
+
+# Or if you're building from source (recommended for opennav_coverage packages):
+# The build system will handle these dependencies automatically
+cd ~/cleanbot_ws
+colcon build --packages-select my_coverage
+```
+
+The error message "Continuing to install resolvable dependencies..." is normal — the rosdep install will succeed with the packages that *can* be resolved.
+
 **Issue:** Package not found error for opennav_coverage
 ```bash
 # Solution: Ensure you cloned the opennav_coverage repository
 cd ~/cleanbot_ws/src
 ls opennav_coverage/
-# Should show multiple subdirectories
+# Should show subdirectories like opennav_coverage, opennav_row_coverage, opennav_coverage_navigator, etc.
 ```
 
-**Issue:** colcon build fails with dependency errors
+**Issue:** colcon build fails with `Could not find a package configuration file` for nav2_ros_common
+
 ```bash
-# Solution: Run rosdep to install missing system packages
-rosdep install --from-paths ~/cleanbot_ws/src --ignore-src -r -y
+# Solution: This package doesn't have a pre-built rosdep. Build from source instead.
+# It's likely already in your opennav_coverage clone, so just build:
+cd ~/cleanbot_ws
+colcon build --packages-select opennav_coverage my_coverage
+source install/setup.bash
+```
+
+If you still get errors, try building with more verbose output:
+```bash
+colcon build --packages-select opennav_coverage my_coverage --event-handlers console_cohesion+
 ```
 
 **Issue:** GUI loads but map scaling is poor quality
 ```bash
 # Solution: Install Pillow for better image interpolation
 pip install Pillow
+```
+
+**Issue:** `Could not find a package configuration file` for backported_bt_navigator
+
+```bash
+# Solution: This is provided by opennav_coverage repository. Ensure you cloned it:
+cd ~/cleanbot_ws/src
+git clone https://github.com/open-navigation/opennav_coverage.git
+cd ~/cleanbot_ws
+colcon build
+```
+
+**Issue:** ROS 2 package resolution fails across systems
+
+Different ROS 2 distributions (Humble, Iron, Jazzy) may have varying dependency availability. If your system is notably different:
+
+```bash
+# Check your ROS 2 distribution
+echo $ROS_DISTRO
+
+# For older/newer distributions, you may need to build opennav_coverage from source
+# or use Docker for consistency. See the opennav_coverage repository for version compatibility.
 ```
 
 ---
