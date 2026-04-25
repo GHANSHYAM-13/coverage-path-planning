@@ -31,10 +31,11 @@ except ImportError:
     _HAS_PIL = False
 
 from geometry_msgs.msg import Point, Point32, Polygon, PoseWithCovarianceStamped
+from nav_msgs.msg import Path
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Empty, String, Float32
 from visualization_msgs.msg import Marker
 
 
@@ -168,10 +169,32 @@ class PolygonDrawer(Node):
         # Robot pose state (set from /amcl_pose)
         self.robot_pose = None          # (map_x, map_y, yaw_rad) or None
         self.robot_canvas_ids = []      # canvas item IDs for the robot indicator
+        
+        # Coverage tracking state
+        self.coverage_percent = 0.0     # Current coverage percentage (0-100)
+        self.coverage_feedback = ""     # Detailed feedback info from coverage server
+        self.task_status = "Idle"       # Current task status
+        
+        # Swath visualization state
+        self.swaths = []                # List of swaths lines (each: [(x1,y1), (x2,y2)])
+        self.robot_position = None      # Robot's current position (x, y)
+        self.swath_canvas_ids = []      # Canvas item IDs for rendered swaths
 
         # ROS subscribers / publishers
         self.status_sub = self.create_subscription(
             String, "/coverage_task_status", self._status_cb, 10
+        )
+        # Coverage percentage from gui_coverage backend
+        self.coverage_percent_sub = self.create_subscription(
+            Float32, "/coverage_percent", self._coverage_percent_cb, 10
+        )
+        # Detailed coverage feedback
+        self.coverage_feedback_sub = self.create_subscription(
+            String, "/coverage_feedback_info", self._coverage_feedback_cb, 10
+        )
+        # Swaths from coverage server
+        self.swaths_sub = self.create_subscription(
+            Marker, "/coverage_server/swaths", self._swaths_cb, 10
         )
         # Robot pose — AMCL publishes here after localisation
         self.pose_sub = self.create_subscription(
@@ -217,7 +240,39 @@ class PolygonDrawer(Node):
     # ── ROS callbacks ─────────────────────────────────────────────────────── #
 
     def _status_cb(self, msg):
+        self.task_status = msg.data
         self.ui_queue.put(("ros_status", msg.data))
+    
+    def _coverage_percent_cb(self, msg):
+        """Update coverage percentage from gui_coverage backend."""
+        self.coverage_percent = msg.data
+        self.ui_queue.put(("coverage_percent", msg.data))
+    
+    def _coverage_feedback_cb(self, msg):
+        """Update coverage feedback info from gui_coverage backend."""
+        self.coverage_feedback = msg.data
+        self.ui_queue.put(("coverage_feedback", msg.data))
+    
+    def _swaths_cb(self, msg):
+        """Process swaths marker from coverage server."""
+        if msg.action == Marker.DELETE:
+            self.swaths = []
+            self.ui_queue.put(("clear_swaths", None))
+            return
+        
+        if msg.type != Marker.LINE_LIST:
+            return
+        
+        # Convert marker points to swath lines
+        # LINE_LIST has pairs of points (from, to)
+        swaths = []
+        for i in range(0, len(msg.points) - 1, 2):
+            p1 = msg.points[i]
+            p2 = msg.points[i + 1]
+            swaths.append([(p1.x, p1.y), (p2.x, p2.y)])
+        
+        self.swaths = swaths
+        self.ui_queue.put(("swaths_update", len(swaths)))
 
     # ── thread-safe point store ───────────────────────────────────────────── #
 
@@ -349,6 +404,7 @@ class PolygonDrawer(Node):
             1.0 - 2.0 * (q.y * q.y + q.z * q.z),
         )
         self.robot_pose = (x, y, yaw)
+        self.robot_position = (x, y)  # Store position for swath coverage calculation
         self.ui_queue.put(("robot_pose", (x, y, yaw)))
 
     # ── RViz preview marker ───────────────────────────────────────────────── #
@@ -819,6 +875,78 @@ def main():
     ]:
         info_row(right, lbl, var)
 
+    # ── COVERAGE PROGRESS section ─────────────────────────────────────────── #
+    section_hdr(right, "Coverage Progress")
+
+    v_coverage_percent = tk.StringVar(value="0.0%")
+    v_coverage_feedback = tk.StringVar(value="Ready to start coverage task")
+    
+    cov_pct_row = tm.reg(tk.Frame(right), bg="panel")
+    cov_pct_row.pack(fill="x", padx=10, pady=(6, 2))
+    tm.reg(
+        tk.Label(cov_pct_row, text="Covered ", font=F_SMALL, anchor="w", width=12),
+        bg="panel", fg="text2",
+    ).pack(side="left")
+    tm.reg(
+        tk.Label(cov_pct_row, textvariable=v_coverage_percent, font=F_BODY_B, anchor="w"),
+        bg="panel", fg="success",
+    ).pack(side="left", fill="x", expand=True)
+    
+    # Progress bar background
+    progress_bg_frame = tm.reg(tk.Frame(right), bg="panel")
+    progress_bg_frame.pack(fill="x", padx=10, pady=(2, 6))
+    
+    progress_canvas = tk.Canvas(
+        progress_bg_frame,
+        width=200, height=20,
+        bg=tm.T["lb_bg"],
+        highlightthickness=1,
+        highlightbackground=tm.T["border"],
+    )
+    tm.reg(progress_canvas, bg="lb_bg")
+    progress_canvas.pack(fill="x", expand=True)
+    
+    # Create progress bar fill rectangle
+    progress_fill = progress_canvas.create_rectangle(
+        0, 0, 0, 20,
+        fill=tm.T["success"],
+        outline="",
+    )
+    tm.reg_canvas_item(progress_canvas, progress_fill, fill="success")
+    
+    # Feedback text
+    feedback_row = tm.reg(tk.Frame(right), bg="panel")
+    feedback_row.pack(fill="x", padx=10, pady=1)
+    tm.reg(
+        tk.Label(
+            feedback_row,
+            text="Status: ",
+            font=F_SMALL,
+            anchor="w",
+        ),
+        bg="panel", fg="text2",
+    ).pack(side="left")
+    tm.reg(
+        tk.Label(
+            feedback_row,
+            textvariable=v_coverage_feedback,
+            font=F_SMALL,
+            anchor="w",
+            wraplength=200,
+            justify="left",
+        ),
+        bg="panel", fg="text",
+    ).pack(side="left", fill="x", expand=True)
+
+    def update_progress_bar(percent):
+        """Update the progress bar fill based on coverage percentage."""
+        # Get canvas width
+        width = progress_canvas.winfo_width()
+        if width <= 1:
+            width = 200
+        fill_width = max(0, min(width, (percent / 100.0) * width))
+        progress_canvas.coords(progress_fill, 0, 0, fill_width, 20)
+
     # ── SELECTED CORNERS section ──────────────────────────────────────────── #
     section_hdr(right, "Selected Corners")
 
@@ -870,6 +998,13 @@ def main():
     # Apply initial theme to root window
     root.config(bg=tm.T["bg"])
     tm.hook(lambda T: root.config(bg=T["bg"]))
+    
+    # Theme hook for progress canvas
+    tm.hook(lambda T: progress_canvas.config(
+        bg=T["lb_bg"],
+        highlightbackground=T["border"],
+    ))
+    tm.hook(lambda T: progress_canvas.itemconfig(progress_fill, fill=T["success"]))
 
     # ══════════════════════════════════════════════════════════════════════ #
     #  Drawing (polygon preview on canvas)                                   #
@@ -986,6 +1121,68 @@ def main():
         v_corners.set(str(len(pts)))
         redraw()
 
+    def draw_swaths():
+        """Render zigzag coverage swaths on the canvas."""
+        T = tm.T
+        
+        # Clear old swath renderings
+        for item_id in node.swath_canvas_ids:
+            try:
+                canvas.delete(item_id)
+            except Exception:
+                pass
+        node.swath_canvas_ids.clear()
+        
+        if not node.swaths:
+            return
+        
+        # Determine coverage color based on distance from robot
+        covered_color = T["success"]       # Green for covered swaths
+        uncovered_color = T["accent_dim"]  # Faded blue for uncovered swaths
+        
+        # Coverage distance threshold (within this distance from robot = covered)
+        COVERED_THRESHOLD = 0.5  # meters
+        
+        for swath in node.swaths:
+            if len(swath) < 2:
+                continue
+            
+            # Convert map coordinates to canvas coordinates
+            p1_map, p2_map = swath[0], swath[1]
+            p1_canvas = node.map_to_canvas(p1_map[0], p1_map[1])
+            p2_canvas = node.map_to_canvas(p2_map[0], p2_map[1])
+            
+            # Determine if this swath has been covered
+            is_covered = False
+            if node.robot_position:
+                # Check if robot is close to any part of this swath
+                robot_x, robot_y = node.robot_position
+                dist_to_p1 = math.sqrt((p1_map[0] - robot_x)**2 + (p1_map[1] - robot_y)**2)
+                dist_to_p2 = math.sqrt((p2_map[0] - robot_x)**2 + (p2_map[1] - robot_y)**2)
+                dist_to_line = min(dist_to_p1, dist_to_p2)
+                is_covered = dist_to_line < COVERED_THRESHOLD
+            
+            # Draw swath line
+            color = covered_color if is_covered else uncovered_color
+            line_width = 3 if is_covered else 2
+            opacity_hex = "FF" if is_covered else "80"  # Full or 50% opacity
+            
+            # For Tk, we can't do actual transparency, so we'll use color fading
+            dash_pattern = () if is_covered else (4, 4)  # Solid for covered, dashed for uncovered
+            
+            try:
+                item_id = canvas.create_line(
+                    p1_canvas[0], p1_canvas[1], p2_canvas[0], p2_canvas[1],
+                    fill=color,
+                    width=line_width,
+                    dash=dash_pattern,
+                    capstyle=tk.ROUND,
+                    joinstyle=tk.ROUND,
+                )
+                node.swath_canvas_ids.append(item_id)
+            except Exception as e:
+                node.get_logger().warn(f"Failed to draw swath: {e}")
+
     # ══════════════════════════════════════════════════════════════════════ #
     #  Status helpers                                                         #
     # ══════════════════════════════════════════════════════════════════════ #
@@ -1032,6 +1229,7 @@ def main():
         theme_btn.config(text=tm.T["theme_icon"])
         # listbox alternating rows need manual refresh
         refresh()
+        draw_swaths()  # Redraw swaths with new theme colors
 
     theme_btn.config(command=toggle_theme)
 
@@ -1054,6 +1252,22 @@ def main():
             elif evt == "robot_pose":
                 # Just redraw to move the indicator; no full refresh needed
                 draw_robot()
+            elif evt == "coverage_percent":
+                # Update coverage progress bar
+                v_coverage_percent.set(f"{data:.1f}%")
+                update_progress_bar(data)
+                draw_swaths()  # Redraw swaths to show coverage progress
+            elif evt == "coverage_feedback":
+                # Update detailed feedback text
+                v_coverage_feedback.set(data)
+            elif evt == "swaths_update":
+                # Swaths have been updated from coverage server
+                draw_swaths()
+            elif evt == "clear_swaths":
+                # Clear swaths visualization
+                for item_id in node.swath_canvas_ids:
+                    canvas.delete(item_id)
+                node.swath_canvas_ids.clear()
             elif evt == "popup":
                 messagebox.showwarning("Coverage Area Selector", data)
         root.after(100, pump)

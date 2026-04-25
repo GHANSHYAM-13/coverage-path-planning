@@ -16,7 +16,7 @@ from opennav_coverage_msgs.action import NavigateCompleteCoverage
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
-from std_msgs.msg import Empty, String
+from std_msgs.msg import Empty, String, Float32
 from visualization_msgs.msg import Marker
 
 
@@ -40,6 +40,10 @@ class GuiCoverage(Node):
         self.status = None
         self.feedback = None
         self.is_processing = False
+        
+        # Track total distance for coverage percentage calculation
+        self.total_distance = 0.0
+        self.initial_distance_remaining = 0.0
 
         self.coverage_client = ActionClient(
             self, NavigateCompleteCoverage, 'navigate_complete_coverage'
@@ -57,6 +61,14 @@ class GuiCoverage(Node):
         )
         self.status_pub = self.create_publisher(
             String, '/coverage_task_status', 10
+        )
+        # New publisher for coverage percentage
+        self.coverage_percent_pub = self.create_publisher(
+            Float32, '/coverage_percent', 10
+        )
+        # New publisher for coverage feedback info  
+        self.coverage_feedback_pub = self.create_publisher(
+            String, '/coverage_feedback_info', 10
         )
 
         self.get_logger().info('GUI coverage backend ready')
@@ -217,9 +229,37 @@ class GuiCoverage(Node):
         self.status = None
         self.feedback = None
         self.is_processing = False
+        self.total_distance = 0.0
+        self.initial_distance_remaining = 0.0
+        
+        # Reset coverage percentage
+        percent_msg = Float32()
+        percent_msg.data = 0.0
+        self.coverage_percent_pub.publish(percent_msg)
 
     def feedback_callback(self, message):
         self.feedback = message.feedback
+        
+        # Capture initial distance on first feedback
+        if self.initial_distance_remaining == 0.0 and self.feedback.distance_remaining > 0:
+            self.initial_distance_remaining = self.feedback.distance_remaining
+            self.total_distance = self.feedback.distance_remaining
+        
+        # Calculate and publish coverage percentage
+        if self.total_distance > 0:
+            distance_covered = self.total_distance - self.feedback.distance_remaining
+            coverage_percent = (distance_covered / self.total_distance) * 100.0
+            coverage_percent = max(0.0, min(100.0, coverage_percent))  # Clamp to 0-100
+            
+            percent_msg = Float32()
+            percent_msg.data = coverage_percent
+            self.coverage_percent_pub.publish(percent_msg)
+            
+            # Also publish detailed feedback info
+            feedback_info = f"Coverage: {coverage_percent:.1f}% | Remaining: {self.feedback.distance_remaining:.2f}m | Time: {self.feedback.navigation_time.sec}s"
+            info_msg = String()
+            info_msg.data = feedback_info
+            self.coverage_feedback_pub.publish(info_msg)
 
     def to_polygon(self, field):
         polygon = Polygon()
