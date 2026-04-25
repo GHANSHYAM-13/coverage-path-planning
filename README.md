@@ -37,6 +37,169 @@ This package does not implement its own zigzag planner.
 
 ---
 
+## Installation & Dependencies
+
+### System Requirements
+
+- **ROS 2** (Humble or later recommended)
+- **Python 3.8+**
+- **colcon-core** build system
+
+### Required ROS 2 Dependencies
+
+When you clone this repository into your ROS 2 workspace, the following dependencies must be installed:
+
+#### Core ROS 2 Packages
+```bash
+sudo apt-get install -y \
+  ros-<distro>-nav2-bringup \
+  ros-<distro>-nav2-map-server \
+  ros-<distro>-nav2-amcl \
+  ros-<distro>-nav2-controller \
+  ros-<distro>-nav2-planner \
+  ros-<distro>-nav2-behaviors \
+  ros-<distro>-nav2-smoother \
+  ros-<distro>-nav2-velocity-smoother \
+  ros-<distro>-nav2-lifecycle-manager
+```
+
+#### OpenNav Coverage Stack (Required)
+
+This is the **most critical dependency**. Clone these packages into your workspace:
+
+```bash
+cd ~/cleanbot_ws/src
+
+# Clone the OpenNav coverage packages
+git clone https://github.com/open-navigation/opennav_coverage.git
+
+# This will provide:
+# - opennav_coverage
+# - opennav_row_coverage
+# - opennav_coverage_msgs
+# - opennav_coverage_bt
+# - opennav_coverage_navigator
+# - backported_bt_navigator
+```
+
+Alternative (if using a workspace with opennav already):
+```bash
+sudo apt-get install -y ros-<distro>-opennav-coverage
+```
+
+> **Note:** The `opennav_coverage` package is essential for coverage path planning. Without it, the coverage navigation will not work.
+
+#### Standard Message/Service Types
+```bash
+sudo apt-get install -y \
+  ros-<distro>-geometry-msgs \
+  ros-<distro>-action-msgs \
+  ros-<distro>-lifecycle-msgs \
+  ros-<distro>-nav2-msgs \
+  ros-<distro>-std-msgs \
+  ros-<distro>-visualization-msgs
+```
+
+### Optional Python Dependencies
+
+To enable smooth map scaling in the GUI, install Pillow:
+
+```bash
+pip install Pillow
+```
+
+Without Pillow, the map still loads but uses integer-scale interpolation which may have lower quality for some map sizes.
+
+If you want to use the GUI with better performance:
+
+```bash
+pip install Pillow PyQt5
+```
+
+### Complete Installation Procedure
+
+1. **Clone the workspace (if not already done):**
+   ```bash
+   mkdir -p ~/cleanbot_ws/src
+   cd ~/cleanbot_ws/src
+   git clone <this-repo-url> my_coverage
+   ```
+
+2. **Clone OpenNav coverage packages:**
+   ```bash
+   cd ~/cleanbot_ws/src
+   git clone https://github.com/open-navigation/opennav_coverage.git
+   ```
+
+3. **Install system dependencies:**
+   ```bash
+   cd ~/cleanbot_ws
+   rosdep install --from-paths src --ignore-src -r -y
+   ```
+
+4. **Install Python dependencies:**
+   ```bash
+   pip install Pillow
+   ```
+
+5. **Build the packages:**
+   ```bash
+   cd ~/cleanbot_ws
+   colcon build --packages-select my_coverage opennav_coverage
+   source install/setup.bash
+   ```
+
+6. **Verify installation:**
+   ```bash
+   ros2 pkg list | grep my_coverage
+   ros2 pkg list | grep opennav_coverage
+   ```
+
+### Dependency Summary Table
+
+| Package | Type | Source | Purpose |
+|---------|------|--------|---------|
+| **opennav_coverage** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Coverage path planning core engine |
+| **opennav_row_coverage** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Row-based coverage planning |
+| **opennav_coverage_msgs** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Message definitions for coverage |
+| **opennav_coverage_bt** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Behavior tree definitions |
+| **opennav_coverage_navigator** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Coverage action server |
+| **backported_bt_navigator** | ROS 2 | GitHub (open-navigation/opennav_coverage) | Behavior tree navigation support |
+| **nav2_bringup** | ROS 2 | apt | Nav2 launch utilities |
+| **nav2_map_server** | ROS 2 | apt | Map file server |
+| **nav2_amcl** | ROS 2 | apt | Adaptive Monte Carlo Localization |
+| **nav2_controller** | ROS 2 | apt | Base controller |
+| **nav2_planner** | ROS 2 | apt | Path planner |
+| **nav2_behaviors** | ROS 2 | apt | Nav2 behavior plugins |
+| **nav2_smoother** | ROS 2 | apt | Path smoothing |
+| **nav2_velocity_smoother** | ROS 2 | apt | Velocity profile smoothing |
+| **nav2_lifecycle_manager** | ROS 2 | apt | Lifecycle node management |
+| **Pillow** | Python | pip | Optional: image processing for GUI |
+
+### Troubleshooting Installation
+
+**Issue:** Package not found error for opennav_coverage
+```bash
+# Solution: Ensure you cloned the opennav_coverage repository
+cd ~/cleanbot_ws/src
+ls opennav_coverage/
+# Should show multiple subdirectories
+```
+
+**Issue:** colcon build fails with dependency errors
+```bash
+# Solution: Run rosdep to install missing system packages
+rosdep install --from-paths ~/cleanbot_ws/src --ignore-src -r -y
+```
+
+**Issue:** GUI loads but map scaling is poor quality
+```bash
+# Solution: Install Pillow for better image interpolation
+pip install Pillow
+```
+
+---
+
 ## GUI Overview
 
 The GUI (`polygon_drawer.py` + `gui_coverage.py`) provides an industrial
@@ -118,23 +281,35 @@ may be lower for maps that require a non-integer scale factor.
 
 ## Prerequisites
 
-Before using `my_coverage`, your robot should already provide:
+Before using `my_coverage`, ensure:
 
-- TF tree for `map`, `odom`, and your base frame
-- Odometry
-- A valid scan topic for obstacle avoidance
-- Motor control through `cmd_vel`
+1. **Installation complete:** Follow the [Installation & Dependencies](#installation--dependencies) section above
+2. **ROS 2 environment sourced:** `source ~/cleanbot_ws/install/setup.bash`
+3. **Robot hardware provides:**
+   - TF tree for `map`, `odom`, and your base frame
+   - Odometry topic (typically `/odom`)
+   - A valid scan topic for obstacle avoidance (typically `/scan`)
+   - Motor control through `cmd_vel` topic
 
-If another package already provides localization, skip
-`localization.launch.py` and only launch the coverage navigation and GUI parts.
+If another package already provides localization (e.g., from your robot's main bringup), you can skip `localization.launch.py` and only launch the coverage navigation and GUI components.
 
 ---
 
 ## Build
 
+Once all dependencies are installed (see [Installation & Dependencies](#installation--dependencies)), build the package:
+
 ```bash
 cd ~/cleanbot_ws
 colcon build --packages-select my_coverage
+source install/setup.bash
+```
+
+To rebuild with fresh configuration:
+
+```bash
+cd ~/cleanbot_ws
+colcon build --packages-select my_coverage --cmake-clean-cache
 source install/setup.bash
 ```
 
