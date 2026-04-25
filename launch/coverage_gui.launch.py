@@ -12,7 +12,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='False'),
         DeclareLaunchArgument('frame_id', default_value='map'),
-        DeclareLaunchArgument('map', description='Full path to the map yaml file'),
+        DeclareLaunchArgument(
+            'map',
+            default_value='',
+            description='Optional map yaml path; if empty, reopen the last used map',
+        ),
         Node(
             package='my_coverage',
             executable='gui_coverage',

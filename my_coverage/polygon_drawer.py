@@ -16,12 +16,15 @@ Light : chrome  #ECECEC panels, #FFFFFF canvas, #0078D4 accent
 """
 
 import math
+import json
 import os
 import queue
+import re
+import hashlib
 import threading
 import tkinter as tk
 from tkinter import font as tkfont
-from tkinter import messagebox, simpledialog
+from tkinter import filedialog, messagebox
 
 # Optional PIL for smooth image scaling (pip install Pillow)
 try:
@@ -147,13 +150,22 @@ class PolygonDrawer(Node):
         self.declare_parameter("frame_id", "map")
         self.declare_parameter("map", "")
 
+        self.storage_root = os.path.expanduser("~/.ros/my_coverage")
+        self.maps_root = os.path.join(self.storage_root, "maps")
+        self.map_registry_file = os.path.join(self.storage_root, "maps.yaml")
+        os.makedirs(self.maps_root, exist_ok=True)
+
         self.frame_id = self.get_parameter("frame_id").value
-        self.map_yaml_path = self.get_parameter("map").value
-        if not self.map_yaml_path:
-            raise RuntimeError('Parameter "map" must point to a map yaml file')
+        self.map_registry = self._load_map_registry()
+        requested_map = self.get_parameter("map").value
+        self.map_yaml_path = self._resolve_startup_map(requested_map)
 
         self.map_image_path, self.resolution, self.origin = \
             self._load_map_metadata(self.map_yaml_path)
+        self.map_yaml_path = os.path.abspath(self.map_yaml_path)
+        self.map_id = self._map_id_for_path(self.map_yaml_path)
+        self.map_display_name = self._display_name_for_map(self.map_yaml_path)
+        self._remember_current_map()
 
         # Set by main() after the image is loaded/scaled
         self.image_width  = 0   # raw pixel width
@@ -164,8 +176,12 @@ class PolygonDrawer(Node):
         self.ui_queue = queue.Queue()
         self.canvas_points = []   # display-space (scaled) pixel coords
         self.selection_mode = False
+        self.selection_role = "outer"
         self.preview_shape_id = None
         self.preview_vertex_ids = []
+        self.outer_canvas_points = []
+        self.no_go_canvas_polygons = []
+        self.overlay_canvas_ids = []
 
         # Robot pose state (set from /amcl_pose)
         self.robot_pose = None          # (map_x, map_y, yaw_rad) or None
@@ -204,6 +220,9 @@ class PolygonDrawer(Node):
         self.polygon_pub = self.create_publisher(
             Polygon, "/user_selected_field", 10
         )
+        self.polygon_config_pub = self.create_publisher(
+            String, "/user_selected_field_config", 10
+        )
         self.cancel_pub = self.create_publisher(
             Empty, "/cancel_coverage", 10
         )
@@ -211,40 +230,217 @@ class PolygonDrawer(Node):
             Marker, "/user_selected_field_marker", 10
         )
         
-        # Section management
+        # Section management: sections are permanent and scoped per map/floor.
         self.sections = {}  # dict: {section_name: [[x1, y1], [x2, y2], ...]}
-        self.sections_file = os.path.expanduser("~/.ros/coverage_sections.yaml")
         self.load_sections()
 
     # ── section management ─────────────────────────────────────────────────── #
+
+    def _map_id_for_path(self, map_yaml_path):
+        """Stable folder name for a map yaml path."""
+        canonical = os.path.abspath(os.path.expanduser(map_yaml_path))
+        digest = hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:10]
+        base = os.path.splitext(os.path.basename(canonical))[0] or "map"
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._") or "map"
+        return f"{slug}_{digest}"
+
+    def _display_name_for_map(self, map_yaml_path):
+        """Human-readable map label; parent dir helps when files are map.yaml."""
+        canonical = os.path.abspath(os.path.expanduser(map_yaml_path))
+        parent = os.path.basename(os.path.dirname(canonical))
+        base = os.path.basename(canonical)
+        return f"{parent}/{base}" if parent else base
+
+    def _load_map_registry(self):
+        self.last_map_yaml = ""
+        if not os.path.exists(self.map_registry_file):
+            return {}
+        try:
+            with open(self.map_registry_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                return {}
+            last_map_yaml = data.get("last_map_yaml", "")
+            if isinstance(last_map_yaml, str):
+                self.last_map_yaml = last_map_yaml
+            maps = data.get("maps", {})
+            return maps if isinstance(maps, dict) else {}
+        except Exception as e:
+            self.get_logger().error(f"Failed to load map registry: {e}")
+            return {}
+
+    def _resolve_startup_map(self, requested_map):
+        requested_map = str(requested_map or "").strip()
+        if requested_map:
+            return os.path.abspath(os.path.expanduser(requested_map))
+
+        if self.last_map_yaml:
+            last_map = os.path.abspath(os.path.expanduser(self.last_map_yaml))
+            if os.path.exists(last_map):
+                return last_map
+
+        for _map_id, record in sorted(
+            self.map_registry.items(),
+            key=lambda item: item[1].get("name", item[0]).lower(),
+        ):
+            yaml_path = record.get("yaml", "")
+            if not yaml_path:
+                continue
+            candidate = os.path.abspath(os.path.expanduser(yaml_path))
+            if os.path.exists(candidate):
+                return candidate
+
+        raise RuntimeError(
+            'No map selected. Launch once with map:=/absolute/path/to/map.yaml '
+            'or add a map through the GUI.'
+        )
+
+    def _persist_map_registry(self):
+        try:
+            os.makedirs(self.storage_root, exist_ok=True)
+            with open(self.map_registry_file, "w", encoding="utf-8") as f:
+                yaml.safe_dump(
+                    {
+                        "last_map_id": getattr(self, "map_id", ""),
+                        "last_map_yaml": getattr(self, "map_yaml_path", ""),
+                        "maps": self.map_registry,
+                    },
+                    f,
+                    sort_keys=True,
+                )
+        except Exception as e:
+            self.get_logger().error(f"Failed to save map registry: {e}")
+
+    def _remember_current_map(self):
+        self.map_registry[self.map_id] = {
+            "name": self.map_display_name,
+            "yaml": self.map_yaml_path,
+            "sections_file": self.get_sections_file(create=False),
+        }
+        self._persist_map_registry()
+
+    def known_maps(self):
+        """Return registered map records that still point to an existing yaml."""
+        records = []
+        stale_ids = []
+        for map_id, record in sorted(
+            self.map_registry.items(),
+            key=lambda item: item[1].get("name", item[0]).lower(),
+        ):
+            yaml_path = record.get("yaml", "")
+            if yaml_path and os.path.exists(yaml_path):
+                records.append((map_id, record))
+            else:
+                stale_ids.append(map_id)
+        for map_id in stale_ids:
+            self.map_registry.pop(map_id, None)
+        if stale_ids:
+            self._persist_map_registry()
+        return records
+
+    def load_map(self, yaml_path):
+        """Switch the GUI to another floor/map and load its saved sections."""
+        yaml_path = os.path.abspath(os.path.expanduser(yaml_path))
+        map_image_path, resolution, origin = self._load_map_metadata(yaml_path)
+        self.map_yaml_path = yaml_path
+        self.map_image_path = map_image_path
+        self.resolution = resolution
+        self.origin = origin
+        self.map_id = self._map_id_for_path(yaml_path)
+        self.map_display_name = self._display_name_for_map(yaml_path)
+        self._remember_current_map()
+        self.load_sections()
+        self.selection_mode = False
+        self.outer_canvas_points = []
+        self.no_go_canvas_polygons = []
+        self.selection_role = "outer"
+        self.set_pts([])
+        self.swaths = []
+        self._pub_preview_marker(clear=True)
+        self.ui_queue.put(("local_status", ("info", f"Loaded map: {self.map_display_name}")))
     
-    def get_sections_file(self):
+    def get_sections_file(self, create=True):
         """Get path to sections storage file."""
-        os.makedirs(os.path.dirname(self.sections_file), exist_ok=True)
-        return self.sections_file
+        sections_dir = os.path.join(self.maps_root, self.map_id)
+        if create:
+            os.makedirs(sections_dir, exist_ok=True)
+        return os.path.join(sections_dir, "sections.yaml")
     
     def load_sections(self):
         """Load saved sections from YAML file."""
         sections_file = self.get_sections_file()
         if os.path.exists(sections_file):
             try:
-                with open(sections_file, 'r') as f:
+                with open(sections_file, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f)
-                    self.sections = data.get('sections', {}) if data else {}
-                    self.get_logger().info(f"Loaded {len(self.sections)} saved sections")
+                    raw_sections = data.get("sections", {}) if data else {}
+                    self.sections = {
+                        name: self._normalize_section_record(section)
+                        for name, section in raw_sections.items()
+                        if self._normalize_section_record(section)["outer"]
+                    }
+                    self.get_logger().info(
+                        f"Loaded {len(self.sections)} saved sections for {self.map_display_name}"
+                    )
             except Exception as e:
                 self.get_logger().error(f"Failed to load sections: {e}")
                 self.sections = {}
         else:
-            self.sections = {}
+            self.sections = self._load_legacy_sections()
+            if self.sections:
+                self._persist_sections()
+
+    def _load_legacy_sections(self):
+        """One-time compatibility with the old global sections file."""
+        legacy_file = os.path.expanduser("~/.ros/coverage_sections.yaml")
+        if not os.path.exists(legacy_file):
+            return {}
+        try:
+            with open(legacy_file, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            sections = data.get("sections", {})
+            if isinstance(sections, dict) and sections:
+                normalized = {
+                    name: self._normalize_section_record(section)
+                    for name, section in sections.items()
+                    if self._normalize_section_record(section)["outer"]
+                }
+                self.get_logger().info(
+                    f"Imported {len(normalized)} legacy sections into {self.map_display_name}"
+                )
+                return normalized
+        except Exception as e:
+            self.get_logger().warn(f"Could not import legacy sections: {e}")
+        return {}
     
-    def save_section(self, section_name, field):
-        """Save a polygon as a named section."""
-        # Ensure polygon is closed
-        if len(field) >= 2 and field[0] != field[-1]:
-            field = list(field) + [field[0]]
-        
-        self.sections[section_name] = field
+    def _close_polygon(self, polygon):
+        closed = [list(point) for point in polygon]
+        if len(closed) >= 2 and closed[0] != closed[-1]:
+            closed.append(list(closed[0]))
+        return closed
+
+    def _normalize_section_record(self, section):
+        if isinstance(section, dict):
+            outer = self._close_polygon(section.get("outer", []))
+            holes = [
+                self._close_polygon(hole)
+                for hole in section.get("holes", [])
+                if isinstance(hole, list)
+            ]
+        else:
+            outer = self._close_polygon(section if isinstance(section, list) else [])
+            holes = []
+        holes = [hole for hole in holes if len(hole) >= 4]
+        if len(outer) < 4:
+            return {"outer": [], "holes": []}
+        return {"outer": outer, "holes": holes}
+
+    def save_section(self, section_name, section):
+        """Save a named section with outer boundary and optional holes."""
+        normalized = self._normalize_section_record(section)
+        if not normalized["outer"]:
+            raise ValueError("Section outer polygon must have at least 3 corners")
+        self.sections[section_name] = normalized
         self._persist_sections()
         self.get_logger().info(f"Saved section: {section_name}")
         return section_name
@@ -260,15 +456,28 @@ class PolygonDrawer(Node):
     
     def get_section(self, section_name):
         """Get a saved section by name."""
-        return self.sections.get(section_name)
+        section = self.sections.get(section_name)
+        if not section:
+            return None
+        return self._normalize_section_record(section)
     
     def _persist_sections(self):
         """Write sections to YAML file."""
         try:
             sections_file = self.get_sections_file()
-            data = {'sections': self.sections}
-            with open(sections_file, 'w') as f:
-                yaml.dump(data, f, default_flow_style=False)
+            data = {
+                "map": {
+                    "id": self.map_id,
+                    "name": self.map_display_name,
+                    "yaml": self.map_yaml_path,
+                    "image": self.map_image_path,
+                    "resolution": self.resolution,
+                    "origin": self.origin,
+                },
+                "sections": self.sections,
+            }
+            with open(sections_file, "w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, default_flow_style=False, sort_keys=True)
         except Exception as e:
             self.get_logger().error(f"Failed to save sections: {e}")
 
@@ -349,30 +558,74 @@ class PolygonDrawer(Node):
     # ── UI actions ────────────────────────────────────────────────────────── #
 
     def clear_points(self):
+        self.outer_canvas_points = []
+        self.no_go_canvas_polygons = []
         self.set_pts([])
+        self.selection_role = "outer"
+        self.selection_mode = False
         self._pub_preview_marker(clear=True)
         self.ui_queue.put(("refresh", None))
         self.ui_queue.put(("local_status", ("idle", "Selection cleared")))
 
     def undo_last(self):
         pts = self.get_pts()
-        if not pts:
+        if pts:
+            pts.pop()
+            self.set_pts(pts)
+            self._pub_preview_marker(clear=not pts and not self.outer_canvas_points)
+            self.ui_queue.put(("refresh", None))
+            n = len(pts)
+            self.ui_queue.put((
+                "local_status",
+                ("info", f"Corner removed — {n} corner{'s' if n != 1 else ''} remaining"),
+            ))
             return
-        pts.pop()
-        self.set_pts(pts)
-        self._pub_preview_marker(clear=not pts)
-        self.ui_queue.put(("refresh", None))
-        n = len(pts)
-        self.ui_queue.put((
-            "local_status",
-            ("info", f"Corner removed — {n} corner{'s' if n != 1 else ''} remaining"),
-        ))
 
-    def start_selection_mode(self):
+        if self.no_go_canvas_polygons:
+            self.no_go_canvas_polygons.pop()
+            self._pub_preview_marker(clear=not self.outer_canvas_points)
+            self.ui_queue.put(("refresh", None))
+            self.ui_queue.put((
+                "local_status",
+                ("info", "Last no-go zone removed"),
+            ))
+            return
+
+        if self.outer_canvas_points:
+            self.outer_canvas_points = []
+            self._pub_preview_marker(clear=True)
+            self.ui_queue.put(("refresh", None))
+            self.ui_queue.put((
+                "local_status",
+                ("info", "Area boundary removed"),
+            ))
+
+    def start_selection_mode(self, role="outer"):
+        if role == "outer":
+            self.selection_mode = True
+            self.selection_role = "outer"
+            self.outer_canvas_points = []
+            self.no_go_canvas_polygons = []
+            self.set_pts([])
+            self._pub_preview_marker(clear=True)
+            self.ui_queue.put(("refresh", None))
+            self.ui_queue.put((
+                "local_status",
+                ("info", "Area mode — click outer boundary corners in order"),
+            ))
+            return
+
+        if not self._ensure_outer_boundary():
+            return
+
         self.selection_mode = True
+        self.selection_role = "hole"
+        self.set_pts([])
+        self._pub_preview_marker()
+        self.ui_queue.put(("refresh", None))
         self.ui_queue.put((
             "local_status",
-            ("info", "Selection mode — click map corners in order"),
+            ("info", "No-go mode — click obstacle boundary corners in order"),
         ))
 
     def add_corner(self, event):
@@ -385,37 +638,120 @@ class PolygonDrawer(Node):
         self.set_pts(pts)
         self._pub_preview_marker()
         self.ui_queue.put(("refresh", None))
+        target = "area" if self.selection_role == "outer" else "no-go zone"
         self.ui_queue.put((
             "local_status",
-            ("info", f"Corner {len(pts)} placed — add more or Send Polygon"),
+            ("info", f"{target.capitalize()} corner {len(pts)} placed"),
         ))
 
     def send_polygon(self):
-        pts = self.get_pts()
-        if len(pts) < 3:
-            self.ui_queue.put((
-                "popup",
-                "Select at least 3 corners on the map before sending.",
-            ))
+        selection = self._finalize_current_selection()
+        if selection is None:
             return
 
-        map_pts = [self._c2m(p) for p in pts]
-        closed = list(map_pts)
-        if closed[0] != closed[-1]:
-            closed.append(closed[0])
-
-        msg = Polygon()
-        for x, y in closed:
-            pt = Point32()
-            pt.x, pt.y = float(x), float(y)
-            msg.points.append(pt)
-
-        self.polygon_pub.publish(msg)
+        self.selection_mode = False
+        self.selection_role = "outer"
+        self._publish_polygon_config(selection["polygons"])
         self._pub_preview_marker()
         self.ui_queue.put((
             "local_status",
-            ("success", f"Polygon ({len(pts)} corners) sent — coverage starting"),
+            (
+                "success",
+                f"Coverage job sent — {len(selection['holes'])} no-go zone(s)",
+            ),
         ))
+
+    def send_saved_sections(self, section_names):
+        """Publish one or more saved sections; gui_coverage queues them."""
+        sent = 0
+        for section_name in section_names:
+            section = self.get_section(section_name)
+            if not section:
+                continue
+            outer = section["outer"][:-1] if section["outer"] and section["outer"][0] == section["outer"][-1] else section["outer"]
+            holes = [
+                hole[:-1] if hole and hole[0] == hole[-1] else hole
+                for hole in section["holes"]
+            ]
+            self.outer_canvas_points = [self.map_to_canvas(x, y) for x, y in outer]
+            self.no_go_canvas_polygons = [
+                [self.map_to_canvas(x, y) for x, y in hole]
+                for hole in holes
+            ]
+            self.selection_mode = False
+            self.selection_role = "outer"
+            self.set_pts([])
+            self._publish_polygon_config([section["outer"]] + section["holes"])
+            sent += 1
+
+        if sent:
+            self._pub_preview_marker()
+            self.ui_queue.put(("refresh", None))
+            noun = "section" if sent == 1 else "sections"
+            self.ui_queue.put((
+                "local_status",
+                ("success", f"{sent} saved {noun} sent to coverage queue"),
+            ))
+
+    def _ensure_outer_boundary(self):
+        pts = self.get_pts()
+        if self.outer_canvas_points:
+            if self.selection_role == "outer" and pts:
+                if len(pts) < 3:
+                    self.ui_queue.put(("popup", "Complete the outer area before adding a no-go zone."))
+                    return False
+                self.outer_canvas_points = list(pts)
+                self.set_pts([])
+        elif len(pts) >= 3 and self.selection_role == "outer":
+            self.outer_canvas_points = list(pts)
+            self.set_pts([])
+        else:
+            self.ui_queue.put(("popup", "Draw the cleaning area first, then add no-go zones."))
+            return False
+        return True
+
+    def _finalize_current_selection(self):
+        pts = self.get_pts()
+        if pts:
+            if len(pts) < 3:
+                self.ui_queue.put(("popup", "Each polygon needs at least 3 corners."))
+                return None
+            if self.selection_role == "outer":
+                self.outer_canvas_points = list(pts)
+                self.no_go_canvas_polygons = []
+            else:
+                if not self._ensure_outer_boundary():
+                    return None
+                self.no_go_canvas_polygons.append(list(pts))
+            self.set_pts([])
+
+        if not self.outer_canvas_points:
+            self.ui_queue.put(("popup", "Select the cleaning area before sending."))
+            return None
+
+        outer_map = self._close_polygon([self._c2m(point) for point in self.outer_canvas_points])
+        holes_map = [
+            self._close_polygon([self._c2m(point) for point in hole])
+            for hole in self.no_go_canvas_polygons
+            if len(hole) >= 3
+        ]
+
+        self._pub_preview_marker()
+        self.ui_queue.put(("refresh", None))
+        return {
+            "outer": outer_map,
+            "holes": holes_map,
+            "polygons": [outer_map] + holes_map,
+        }
+
+    def _publish_polygon_config(self, polygons):
+        payload = {
+            "frame_id": self.frame_id,
+            "polygons": polygons,
+        }
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.polygon_config_pub.publish(msg)
 
     def cancel_coverage(self):
         self.cancel_pub.publish(Empty())
@@ -432,17 +768,17 @@ class PolygonDrawer(Node):
                 "Enter a valid section name (e.g., 'Kitchen', 'Living Room')",
             ))
             return False
-        
-        pts = self.get_pts()
-        if len(pts) < 3:
-            self.ui_queue.put((
-                "popup",
-                "Select at least 3 corners before saving.",
-            ))
+
+        selection = self._finalize_current_selection()
+        if selection is None:
             return False
-        
-        map_pts = [self._c2m(p) for p in pts]
-        self.save_section(section_name, map_pts)
+
+        self.save_section(
+            section_name,
+            {"outer": selection["outer"], "holes": selection["holes"]},
+        )
+        self.selection_mode = False
+        self.selection_role = "outer"
         self.ui_queue.put((
             "local_status",
             ("success", f"Section '{section_name}' saved successfully"),
@@ -498,26 +834,52 @@ class PolygonDrawer(Node):
     # ── RViz preview marker ───────────────────────────────────────────────── #
 
     def _pub_preview_marker(self, clear=False):
-        m = Marker()
-        m.header.frame_id = self.frame_id
-        m.header.stamp = self.get_clock().now().to_msg()
-        m.ns, m.id = "selected_polygon", 1
-        m.type = Marker.LINE_STRIP
-        m.action = Marker.DELETE if clear else Marker.ADD
-        m.scale.x = 0.05
-        m.color.r, m.color.g, m.color.b = 0.0, 0.47, 0.84
-        m.color.a = 1.0
+        polygons = []
         if not clear:
+            if self.outer_canvas_points:
+                polygons.append(("outer", self.outer_canvas_points))
             raw = self.get_pts()
             if raw:
-                mp = [self._c2m(p) for p in raw]
-                if mp[0] != mp[-1]:
-                    mp.append(mp[0])
-                for x, y in mp:
-                    pt = Point()
-                    pt.x, pt.y, pt.z = float(x), float(y), 0.0
-                    m.points.append(pt)
-        self.marker_pub.publish(m)
+                polygons.append((self.selection_role, raw))
+            polygons.extend(("hole", hole) for hole in self.no_go_canvas_polygons)
+
+        marker_count = 0
+        for marker_id, (role, raw_polygon) in enumerate(polygons, start=1):
+            if len(raw_polygon) < 2:
+                continue
+            marker = Marker()
+            marker.header.frame_id = self.frame_id
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "selected_polygon_preview"
+            marker.id = marker_id
+            marker.type = Marker.LINE_STRIP
+            marker.action = Marker.ADD
+            marker.scale.x = 0.05
+            if role == "hole":
+                marker.color.r, marker.color.g, marker.color.b = 0.77, 0.17, 0.11
+            else:
+                marker.color.r, marker.color.g, marker.color.b = 0.0, 0.47, 0.84
+            marker.color.a = 1.0
+            map_polygon = [self._c2m(point) for point in raw_polygon]
+            if map_polygon[0] != map_polygon[-1]:
+                map_polygon.append(map_polygon[0])
+            for x, y in map_polygon:
+                pt = Point()
+                pt.x, pt.y, pt.z = float(x), float(y), 0.0
+                marker.points.append(pt)
+            self.marker_pub.publish(marker)
+            marker_count += 1
+
+        previous = getattr(self, "last_preview_marker_count", 0)
+        for marker_id in range(marker_count + 1, previous + 1):
+            marker = Marker()
+            marker.header.frame_id = self.frame_id
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = "selected_polygon_preview"
+            marker.id = marker_id
+            marker.action = Marker.DELETE
+            self.marker_pub.publish(marker)
+        self.last_preview_marker_count = marker_count
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -632,43 +994,45 @@ def main():
     MAP_MAX_W = 900
     MAP_MAX_H = 640
 
-    if _HAS_PIL:
-        pil_raw = _PILImage.open(node.map_image_path)
-        raw_w, raw_h = pil_raw.size
-        node.image_width  = raw_w
-        node.image_height = raw_h
-        node.display_scale = min(MAP_MAX_W / raw_w, MAP_MAX_H / raw_h)
-        disp_w = max(1, int(raw_w * node.display_scale))
-        disp_h = max(1, int(raw_h * node.display_scale))
-        node._display_w = disp_w
-        node._display_h = disp_h
-        scaled_pil = pil_raw.resize((disp_w, disp_h), _PILImage.LANCZOS)
-        node.map_photo = _ImageTk.PhotoImage(scaled_pil)
-    else:
-        # No PIL: load raw, then integer-scale to fit
-        _raw_photo = tk.PhotoImage(master=root, file=node.map_image_path)
-        raw_w = _raw_photo.width()
-        raw_h = _raw_photo.height()
-        node.image_width  = raw_w
-        node.image_height = raw_h
-        # Integer zoom / subsample
-        zoom_x = max(1, MAP_MAX_W // raw_w)
-        zoom_y = max(1, MAP_MAX_H // raw_h)
-        zoom = min(zoom_x, zoom_y)
-        sub_x = max(1, raw_w * zoom // MAP_MAX_W)
-        sub_y = max(1, raw_h * zoom // MAP_MAX_H)
-        sub = max(sub_x, sub_y)
-        if zoom > 1:
-            node.map_photo = _raw_photo.zoom(zoom, zoom)
-            node.display_scale = float(zoom)
-        elif sub > 1:
-            node.map_photo = _raw_photo.subsample(sub, sub)
-            node.display_scale = 1.0 / sub
+    def load_display_map_image():
+        if _HAS_PIL:
+            pil_raw = _PILImage.open(node.map_image_path)
+            raw_w, raw_h = pil_raw.size
+            node.image_width = raw_w
+            node.image_height = raw_h
+            node.display_scale = min(MAP_MAX_W / raw_w, MAP_MAX_H / raw_h)
+            disp_w = max(1, int(raw_w * node.display_scale))
+            disp_h = max(1, int(raw_h * node.display_scale))
+            node._display_w = disp_w
+            node._display_h = disp_h
+            scaled_pil = pil_raw.resize((disp_w, disp_h), _PILImage.LANCZOS)
+            node.map_photo = _ImageTk.PhotoImage(scaled_pil)
         else:
-            node.map_photo = _raw_photo
-            node.display_scale = 1.0
-        node._display_w = int(raw_w * node.display_scale)
-        node._display_h = int(raw_h * node.display_scale)
+            # No PIL: load raw, then integer-scale to fit
+            _raw_photo = tk.PhotoImage(master=root, file=node.map_image_path)
+            raw_w = _raw_photo.width()
+            raw_h = _raw_photo.height()
+            node.image_width = raw_w
+            node.image_height = raw_h
+            zoom_x = max(1, MAP_MAX_W // raw_w)
+            zoom_y = max(1, MAP_MAX_H // raw_h)
+            zoom = min(zoom_x, zoom_y)
+            sub_x = max(1, raw_w * zoom // MAP_MAX_W)
+            sub_y = max(1, raw_h * zoom // MAP_MAX_H)
+            sub = max(sub_x, sub_y)
+            if zoom > 1:
+                node.map_photo = _raw_photo.zoom(zoom, zoom)
+                node.display_scale = float(zoom)
+            elif sub > 1:
+                node.map_photo = _raw_photo.subsample(sub, sub)
+                node.display_scale = 1.0 / sub
+            else:
+                node.map_photo = _raw_photo
+                node.display_scale = 1.0
+            node._display_w = int(raw_w * node.display_scale)
+            node._display_h = int(raw_h * node.display_scale)
+
+    load_display_map_image()
 
     # ══════════════════════════════════════════════════════════════════════ #
     #  Layout: title_bar | (body: map_col | right_panel) | status_bar        #
@@ -695,13 +1059,56 @@ def main():
     )
     pipe_lbl.pack(side="left")
 
+    map_name_var = tk.StringVar(value=f"  {node.map_display_name}")
     map_name_lbl = tm.reg(
         tk.Label(title_bar,
-                 text=f"  {os.path.basename(node.map_yaml_path)}",
+                 textvariable=map_name_var,
                  font=F_BODY),
         bg="panel", fg="text2",
     )
     map_name_lbl.pack(side="left")
+
+    map_choice_var = tk.StringVar(value=node.map_display_name)
+    map_selector = tk.OptionMenu(title_bar, map_choice_var, node.map_display_name)
+    map_selector.config(
+        font=F_SMALL,
+        relief="flat",
+        bd=0,
+        padx=8,
+        pady=3,
+        cursor="hand2",
+        highlightthickness=1,
+        indicatoron=True,
+    )
+    map_selector.config(width=max(18, len(node.map_display_name) + 2))
+    tm.reg(
+        map_selector,
+        bg="panel_lt",
+        fg="text2",
+        activebackground="border",
+        activeforeground="text",
+        highlightbackground="border",
+    )
+    map_selector.pack(side="left", padx=(12, 4), pady=8)
+
+    add_map_btn = tk.Button(
+        title_bar,
+        text="Add Map",
+        font=F_SMALL,
+        relief="flat",
+        bd=0,
+        padx=8,
+        pady=3,
+        cursor="hand2",
+    )
+    tm.reg(
+        add_map_btn,
+        bg="panel_lt",
+        fg="text2",
+        activebackground="border",
+        activeforeground="text",
+    )
+    add_map_btn.pack(side="left", padx=(0, 4), pady=8)
 
     # theme toggle (right side, before ROS badge)
     theme_btn = tm.reg(
@@ -741,12 +1148,22 @@ def main():
     title_sep.pack(fill="x")
 
     # ── body ──────────────────────────────────────────────────────────────── #
-    body = tm.reg(tk.Frame(root), bg="bg")
+    body = tk.PanedWindow(
+        root,
+        orient=tk.HORIZONTAL,
+        sashwidth=8,
+        sashrelief="flat",
+        bd=0,
+        showhandle=False,
+        opaqueresize=True,
+        bg=tm.T["border"],
+    )
     body.pack(fill="both", expand=True)
+    tm.hook(lambda T: body.config(bg=T["border"]))
 
     # ── map column ────────────────────────────────────────────────────────── #
     map_col = tm.reg(tk.Frame(body), bg="bg")
-    map_col.pack(side="left", fill="both", expand=True)
+    body.add(map_col, minsize=520, stretch="always")
 
     map_toolbar = tm.reg(
         tk.Frame(map_col, height=30),
@@ -760,10 +1177,13 @@ def main():
         bg="panel", fg="text3",
     ).pack(side="left", pady=5)
 
+    map_toolbar_var = tk.StringVar(
+        value=f"  {node.resolution:.4f} m/px   frame: {node.frame_id}"
+    )
     tm.reg(
         tk.Label(
             map_toolbar,
-            text=f"  {node.resolution:.4f} m/px   frame: {node.frame_id}",
+            textvariable=map_toolbar_var,
             font=F_SMALL,
         ),
         bg="panel", fg="text3",
@@ -813,16 +1233,12 @@ def main():
     h_sb.config(command=canvas.xview)
     v_sb.config(command=canvas.yview)
 
-    canvas.create_image(0, 0, image=node.map_photo, anchor="nw")
+    node.map_image_item = canvas.create_image(0, 0, image=node.map_photo, anchor="nw")
     canvas.config(scrollregion=(0, 0, node._display_w, node._display_h))
     tm.hook(lambda T: canvas.config(bg=T["canvas_bg"]))
 
-    # ── right panel ───────────────────────────────────────────────────────── #
-    rp_div = tm.reg(tk.Frame(body, width=1), bg="border")
-    rp_div.pack(side="right", fill="y")
-
     right = tm.reg(tk.Frame(body, width=278), bg="panel")
-    right.pack(side="right", fill="y")
+    body.add(right, minsize=280, stretch="never")
     right.pack_propagate(False)
 
     # Helper: section label + separator
@@ -927,8 +1343,21 @@ def main():
         tm.hook(_update)
         return btn
 
-    btn_select = make_btn(ctrl, "Select Area",       node.start_selection_mode, style="primary")
+    btn_select = make_btn(
+        ctrl,
+        "Select Area",
+        lambda: node.start_selection_mode("outer"),
+        style="primary",
+    )
     btn_select.pack(fill="x", pady=3)
+
+    btn_obstacle = make_btn(
+        ctrl,
+        "Add No-Go Zone",
+        lambda: node.start_selection_mode("hole"),
+        style="ghost",
+    )
+    btn_obstacle.pack(fill="x", pady=3)
 
     btn_undo   = make_btn(ctrl, "Undo Corner",       node.undo_last,            style="ghost")
     btn_undo.pack(fill="x", pady=3)
@@ -939,7 +1368,7 @@ def main():
     # separator
     tm.reg(tk.Frame(ctrl, height=1), bg="border").pack(fill="x", pady=8)
 
-    btn_send   = make_btn(ctrl, "Send Polygon",       node.send_polygon,         style="primary")
+    btn_send   = make_btn(ctrl, "Start Cleaning",    node.send_polygon,         style="primary")
     btn_send.pack(fill="x", pady=3)
 
     btn_cancel = make_btn(ctrl, "Cancel Cleaning",   node.cancel_coverage,      style="cancel")
@@ -1006,7 +1435,10 @@ def main():
         saved_sections_listbox.delete(0, tk.END)
         T = tm.T
         for idx, section_name in enumerate(sorted(node.sections.keys())):
-            saved_sections_listbox.insert(tk.END, f"  {section_name}")
+            section = node.get_section(section_name)
+            hole_count = len(section["holes"]) if section else 0
+            label = f"  {section_name}" if hole_count == 0 else f"  {section_name}  ({hole_count} no-go)"
+            saved_sections_listbox.insert(tk.END, label)
             if idx % 2 == 0:
                 saved_sections_listbox.itemconfig(idx, bg=T["lb_alt"])
 
@@ -1023,17 +1455,11 @@ def main():
         
         sections_list = sorted(node.sections.keys())
         selected_names = [sections_list[i] for i in selection]
-        
-        # For now, clean the first selected section
-        # In future, could add support for multiple sequential sections
-        first_section = selected_names[0]
-        section_polygon = node.get_section(first_section)
-        
-        if section_polygon:
-            node.set_pts([node.map_to_canvas(x, y) for x, y in section_polygon])
-            node.ui_queue.put(("refresh", None))
-            node.send_polygon()
-            set_status("info", f"Cleaning section: {first_section}")
+        node.send_saved_sections(selected_names)
+        if len(selected_names) == 1:
+            set_status("info", f"Cleaning section: {selected_names[0]}")
+        else:
+            set_status("info", f"Queued {len(selected_names)} sections")
 
     def delete_selected_section():
         """Delete selected section."""
@@ -1149,6 +1575,11 @@ def main():
         fill_width = max(0, min(width, (percent / 100.0) * width))
         progress_canvas.coords(progress_fill, 0, 0, fill_width, 20)
 
+    progress_canvas.bind(
+        "<Configure>",
+        lambda _event: update_progress_bar(node.coverage_percent),
+    )
+
     # ── SELECTED CORNERS section ──────────────────────────────────────────── #
     section_hdr(right, "Selected Corners")
 
@@ -1183,7 +1614,7 @@ def main():
     status_bar.pack_propagate(False)
 
     instr_var = tk.StringVar(
-        value="Click  Select Area  →  click map corners  →  Send Polygon"
+        value="Select Area  →  Add No-Go Zone (optional)  →  Start cleaning"
     )
     tm.reg(
         tk.Label(status_bar, textvariable=instr_var,
@@ -1216,6 +1647,9 @@ def main():
         if node.preview_shape_id is not None:
             canvas.delete(node.preview_shape_id)
             node.preview_shape_id = None
+        for oid in node.overlay_canvas_ids:
+            canvas.delete(oid)
+        node.overlay_canvas_ids.clear()
         for vid in node.preview_vertex_ids:
             canvas.delete(vid)
         node.preview_vertex_ids.clear()
@@ -1224,19 +1658,46 @@ def main():
         pts = node.get_pts()
         n = len(pts)
 
-        if n >= 3:
-            flat = [c for p in pts for c in p]
-            node.preview_shape_id = canvas.create_polygon(
-                flat,
+        if len(node.outer_canvas_points) >= 3:
+            outer_flat = [coord for point in node.outer_canvas_points for coord in point]
+            outer_id = canvas.create_polygon(
+                outer_flat,
                 outline=T["poly"],
                 fill=T["poly_fill"],
                 stipple=T["poly_stipple"],
                 width=2,
             )
+            node.overlay_canvas_ids.append(outer_id)
+
+        for hole in node.no_go_canvas_polygons:
+            if len(hole) < 3:
+                continue
+            hole_flat = [coord for point in hole for coord in point]
+            hole_id = canvas.create_polygon(
+                hole_flat,
+                outline=T["danger_fg"],
+                fill=T["danger_bg"],
+                stipple=T["poly_stipple"],
+                width=2,
+            )
+            node.overlay_canvas_ids.append(hole_id)
+
+        if n >= 3:
+            flat = [c for p in pts for c in p]
+            outline = T["poly"] if node.selection_role == "outer" else T["danger_fg"]
+            fill = T["poly_fill"] if node.selection_role == "outer" else T["danger_bg"]
+            node.preview_shape_id = canvas.create_polygon(
+                flat,
+                outline=outline,
+                fill=fill,
+                stipple=T["poly_stipple"],
+                width=2,
+            )
         elif n == 2:
+            color = T["poly"] if node.selection_role == "outer" else T["danger_fg"]
             node.preview_shape_id = canvas.create_line(
                 *pts[0], *pts[1],
-                fill=T["poly"], width=2, dash=(6, 3),
+                fill=color, width=2, dash=(6, 3),
             )
 
         for idx, (x, y) in enumerate(pts, start=1):
@@ -1312,7 +1773,7 @@ def main():
     tm.hook(lambda _T: redraw())
 
     def refresh():
-        pts = node.get_pts()
+        pts = node.get_pts() or list(node.outer_canvas_points)
         listbox.delete(0, tk.END)
         T = tm.T
         for idx, pt in enumerate(pts, start=1):
@@ -1421,6 +1882,43 @@ def main():
             return "idle", "Idle"
         return "info", text
 
+    popup_tracker = {"status": None}
+
+    def maybe_show_task_popup(raw_status):
+        status_upper = raw_status.upper()
+        if "RUNNING" in status_upper:
+            normalized = "running"
+        elif "SUCCEEDED" in status_upper:
+            normalized = "succeeded"
+        elif "CANCELED" in status_upper or "CANCELLED" in status_upper:
+            normalized = "canceled"
+        elif "FAILED" in status_upper or "ERROR" in status_upper:
+            normalized = "failed"
+        elif "IDLE" in status_upper:
+            normalized = "idle"
+        else:
+            normalized = None
+
+        if normalized is None or normalized == popup_tracker["status"]:
+            return
+
+        popup_tracker["status"] = normalized
+        if normalized == "running":
+            messagebox.showinfo(
+                "Cleaning Task",
+                "Cleaning task started.",
+            )
+        elif normalized == "succeeded":
+            messagebox.showinfo(
+                "Cleaning Task",
+                "Cleaning task completed successfully.",
+            )
+        elif normalized == "failed":
+            messagebox.showwarning(
+                "Cleaning Task",
+                "Cleaning task failed. If a fixed obstacle is inside the area, add it as a no-go zone and resend.",
+            )
+
     # ══════════════════════════════════════════════════════════════════════ #
     #  Theme toggle                                                           #
     # ══════════════════════════════════════════════════════════════════════ #
@@ -1436,6 +1934,71 @@ def main():
     theme_btn.config(command=toggle_theme)
 
     # ══════════════════════════════════════════════════════════════════════ #
+    #  Map / floor switching                                                  #
+    # ══════════════════════════════════════════════════════════════════════ #
+
+    map_label_to_path = {}
+
+    def refresh_known_maps():
+        """Refresh the top-bar map selector from the persistent map registry."""
+        map_label_to_path.clear()
+        menu = map_selector["menu"]
+        menu.delete(0, "end")
+        selector_width = max(18, len(node.map_display_name) + 2)
+        for _map_id, record in node.known_maps():
+            label = record.get("name", _map_id)
+            yaml_path = record.get("yaml", "")
+            map_label_to_path[label] = yaml_path
+            selector_width = max(selector_width, min(40, len(label) + 2))
+            menu.add_command(
+                label=label,
+                command=lambda value=label: select_registered_map(value),
+            )
+        map_selector.config(width=selector_width)
+        map_choice_var.set(node.map_display_name)
+
+    def apply_loaded_map():
+        load_display_map_image()
+        canvas.itemconfig(node.map_image_item, image=node.map_photo)
+        canvas.config(scrollregion=(0, 0, node._display_w, node._display_h))
+        map_name_var.set(f"  {node.map_display_name}")
+        map_choice_var.set(node.map_display_name)
+        map_toolbar_var.set(f"  {node.resolution:.4f} m/px   frame: {node.frame_id}")
+        v_file.set(os.path.basename(node.map_yaml_path))
+        v_res.set(f"{node.resolution:.4f} m/px")
+        v_dim.set(f"{node.image_width} × {node.image_height} px")
+        refresh_saved_sections()
+        refresh_known_maps()
+        refresh()
+        draw_swaths()
+
+    def switch_map(yaml_path):
+        try:
+            node.load_map(yaml_path)
+            apply_loaded_map()
+        except Exception as e:
+            messagebox.showerror("Map Load Failed", str(e))
+            node.get_logger().error(f"Failed to switch map: {e}")
+
+    def select_registered_map(label):
+        yaml_path = map_label_to_path.get(label)
+        if yaml_path and os.path.abspath(yaml_path) != node.map_yaml_path:
+            switch_map(yaml_path)
+        else:
+            map_choice_var.set(node.map_display_name)
+
+    def add_map_from_file():
+        yaml_path = filedialog.askopenfilename(
+            title="Select floor map YAML",
+            filetypes=[("ROS map YAML", "*.yaml *.yml"), ("All files", "*.*")],
+        )
+        if yaml_path:
+            switch_map(yaml_path)
+
+    add_map_btn.config(command=add_map_from_file)
+    refresh_known_maps()
+
+    # ══════════════════════════════════════════════════════════════════════ #
     #  UI queue pump (100 ms)                                                 #
     # ══════════════════════════════════════════════════════════════════════ #
 
@@ -1448,6 +2011,7 @@ def main():
             if evt == "refresh":
                 refresh()
             elif evt == "ros_status":
+                maybe_show_task_popup(data)
                 set_status(*decode_ros(data))
             elif evt == "local_status":
                 set_status(*data)

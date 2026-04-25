@@ -51,6 +51,9 @@ the coverage task.
 | **Arbitrary polygons** | Draw 3 or more corners in any shape — convexity is not enforced |
 | **Select / Undo / Clear** | Corner-by-corner polygon editing |
 | **Send Polygon** | Publishes the closed polygon to `/user_selected_field` and starts coverage |
+| **Map / floor selector** | Registers map YAML files and switches the GUI between saved floor maps |
+| **Permanent saved sections** | Stores named sections per map under `~/.ros/my_coverage/maps/<map-id>/sections.yaml` |
+| **Queued saved sections** | Select one or more saved sections and run them in order |
 | **Cancel Cleaning** | Sends a cancel request to the active coverage action goal |
 | **Robot indicator** | Live orange circle + heading arrow on the map, updated from `/amcl_pose` |
 | **Light / Dark theme** | One-click toggle; all widgets re-styled at runtime |
@@ -64,8 +67,31 @@ the coverage task.
 | `Undo Corner` | Removes the most recently placed corner |
 | `Clear Selection` | Removes all corners and clears the preview |
 | `Send Polygon` | Closes and sends the polygon; coverage starts immediately |
+| `Save Section` | Stores the selected polygon permanently for the currently selected map |
+| `Clean Selected` | Sends selected saved section(s) to the coverage queue |
+| `Delete` | Removes a saved section from the current map |
 | `Cancel Cleaning` | Cancels the active coverage task (publishes to `/cancel_coverage`) |
 | `☀ Light Mode` / `🌙 Dark Mode` | Toggles between the two UI themes |
+
+### Map / Floor Section Storage
+
+The GUI now treats each map YAML as a separate floor/map record. Saved sections
+are permanent and scoped to that map, so a house with multiple floors can keep
+different section names and polygons for each floor.
+
+```text
+~/.ros/my_coverage/
+├── maps.yaml
+└── maps/
+    └── <map-id>/
+        └── sections.yaml
+```
+
+- The map selector in the top bar lists registered map YAML files.
+- `Add Map` registers and opens another map YAML, such as a second floor.
+- When a map is selected, only the sections saved for that map are shown.
+- If the old `~/.ros/coverage_sections.yaml` file exists, it is imported once
+  into the first selected map that does not already have a new section file.
 
 ### ROS Topics Used by the GUI
 

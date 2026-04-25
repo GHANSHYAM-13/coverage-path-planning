@@ -6,17 +6,31 @@
 
         <GetPoseFromPath path="{path}" pose="{start_pose}" index="0" />
         <ComputePathToPose goal="{start_pose}" path="{path_to_start}" planner_id="GridBased2"/>
-        <FollowPath path="{path_to_start}" controller_id="FollowPath"/>
+        <RecoveryNode number_of_retries="10">
+          <FollowPath path="{path_to_start}" controller_id="FollowPath"/>
+          <RoundRobin>
+            <FollowPath path="{path_to_start}" controller_id="FollowPath1"/>
+            <BackUp backup_dist="0.20" backup_speed="0.05"/>
+            <Spin spin_dist="1.57"/>
+            <Sequence>
+              <ClearEntireCostmap name="ClearLocalCostmap-ToStart" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-ToStart" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Wait wait_duration="2.0"/>
+          </RoundRobin>
+        </RecoveryNode>
 
         <RecoveryNode number_of_retries="100">
           <FollowPath path="{path}" controller_id="FollowPath"/>
           <RoundRobin>
-            <FollowPath path="{path}" controller_id="FollowPath"/>
+            <FollowPath path="{path}" controller_id="FollowPath1"/>
+            <BackUp backup_dist="0.20" backup_speed="0.05"/>
+            <Spin spin_dist="1.57"/>
             <Sequence>
               <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
               <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
             </Sequence>
-            <Wait wait_duration="1.0"/>
+            <Wait wait_duration="2.0"/>
           </RoundRobin>
         </RecoveryNode>
       </Sequence>
