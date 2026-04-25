@@ -13,12 +13,18 @@ This package does not implement its own zigzag planner.
 
 - **`launch/localization.launch.py`**
   Starts `map_server` and `amcl` using the standard Nav2 localization bringup.
+  Use this for a standalone coverage setup on a single robot.
 
 - **`launch/coverage_nav.launch.py`**
   Starts the coverage-following navigation stack in a composable container:
   `planner_server`, `controller_server`, `smoother_server`, `behavior_server`,
   `backported_bt_navigator`, `velocity_smoother`, `coverage_server`, and the
-  Nav2 lifecycle manager.
+  Nav2 lifecycle manager. Use this with `localization.launch.py` for the full stack.
+
+- **`launch/coverage_bringup.launch.py`** *(Alternative)*
+  Includes the standard `nav2_bringup bringup_launch.py` and adds only the
+  coverage-specific components (`coverage_server`, `backported_bt_navigator`).
+  **Use this if your robot is already using `nav2_bringup` successfully.**
 
 - **`launch/coverage_gui.launch.py`**
   Starts a lightweight UI backend plus a standalone map window that loads
@@ -464,7 +470,54 @@ automatically.
 
 ---
 
+## Alternative Launch Flow — Using Standard Nav2 Bringup
+
+If your robot is already using `nav2_bringup bringup_launch.py` successfully,
+use this simpler approach that adds only the coverage components:
+
+### 1. Launch Coverage with Bringup
+
+This single command includes the standard Nav2 bringup **plus** coverage-specific nodes:
+
+```bash
+ros2 launch my_coverage coverage_bringup.launch.py \
+  map:=/absolute/path/to/map.yaml \
+  use_sim_time:=True
+```
+
+This includes:
+- Map server
+- AMCL localization
+- Nav2 navigation stack (planner, controller, smoother)
+- Coverage server
+- Behavior tree navigator for coverage
+- GUI (optional, launch separately if needed)
+
+### 2. GUI Area Selection (Optional)
+
+```bash
+ros2 launch my_coverage coverage_gui.launch.py \
+  map:=/absolute/path/to/map.yaml \
+  use_sim_time:=True
+```
+
+### 3. Alternatively, Use Your Robot's Existing Launch
+
+If your robot already has a custom launch file that works well, you can just run:
+
+```bash
+ros2 launch my_coverage coverage_gui.launch.py \
+  map:=/absolute/path/to/map.yaml \
+  use_sim_time:=True
+```
+
+This assumes your robot's navigation stack is already running (map server, localization, navigation).
+
+---
+
 ## GUI Workflow
+
+### Workflow A: Using my_coverage's full stack (with localization)
 
 1. Launch `localization.launch.py` (if needed).
 2. Launch `coverage_nav.launch.py`.
@@ -474,6 +527,16 @@ automatically.
 6. Click the cleaning-area corners on the map in order (3 or more).
 7. Click **Send Polygon** — coverage starts.
 8. To stop early, click **Cancel Cleaning**.
+
+### Workflow B: Using standard Nav2 bringup (recommended for robots with existing nav2_bringup)
+
+1. Launch `coverage_bringup.launch.py` (includes map server, localization, and coverage).
+2. Launch `coverage_gui.launch.py` with the same `map:=...` path (or use your robot's RViz).
+3. Set the robot pose in RViz — the orange robot indicator will appear on the map.
+4. Click **Select Area** in the GUI.
+5. Click the cleaning-area corners on the map in order (3+ corners).
+6. Click **Send Polygon** — coverage starts automatically.
+7. To stop early, click **Cancel Cleaning**.
 
 ---
 
@@ -546,6 +609,8 @@ To adapt this package to a different robot, update
 
 ## Example Session
 
+### Approach A: Using my_coverage Full Stack
+
 ```bash
 # Terminal 1 — localization
 cd ~/cleanbot_ws && source install/setup.bash
@@ -575,6 +640,37 @@ Then in the GUI:
 3. Click **Select Area** and click the map corners.
 4. Click **Send Polygon**.
 5. Monitor status in the GUI; click **Cancel Cleaning** to stop early.
+
+### Approach B: Using Standard Nav2 Bringup (Recommended for robots with existing nav2_bringup)
+
+```bash
+# Terminal 1 — coverage with bringup (all-in-one)
+cd ~/cleanbot_ws && source install/setup.bash
+ros2 launch my_coverage coverage_bringup.launch.py \
+  map:=/home/svr/ROBOMUSE_WS/testing.yaml \
+  use_sim_time:=True
+```
+
+```bash
+# Terminal 2 — GUI (optional)
+cd ~/cleanbot_ws && source install/setup.bash
+ros2 launch my_coverage coverage_gui.launch.py \
+  map:=/home/svr/ROBOMUSE_WS/testing.yaml \
+  use_sim_time:=True
+```
+
+Then in the GUI or RViz:
+
+1. Set the robot initial pose in RViz.
+2. Wait for the orange robot indicator to appear on the map.
+3. Click **Select Area** and click the map corners.
+4. Click **Send Polygon** to start coverage.
+5. Monitor in the GUI; click **Cancel Cleaning** to stop early.
+
+**Advantages of Approach B:**
+- Single launch command instead of three separate ones
+- Reuses your robot's existing Nav2 configuration
+- Simpler for robots where `nav2_bringup` is already working
 
 ---
 
