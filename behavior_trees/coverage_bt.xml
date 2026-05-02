@@ -1,36 +1,32 @@
 <root main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RateController hz="1.0">
+    <RateController hz="1.0"> <!-- once for stable coverage -->
       <Sequence name="NavigateWithReplanning">
+        <!-- Generate complete coverage path for the field -->
         <ComputeCoveragePath nav_path="{path}" polygons="{field_polygon}" polygons_frame_id="{polygon_frame_id}"/>
-
+        
+        <!-- Navigate to starting pose -->
         <GetPoseFromPath path="{path}" pose="{start_pose}" index="0" />
         <ComputePathToPose goal="{start_pose}" path="{path_to_start}" planner_id="GridBased2"/>
-        <RecoveryNode number_of_retries="10">
-          <FollowPath path="{path_to_start}" controller_id="FollowPath"/>
-          <RoundRobin>
-            <FollowPath path="{path_to_start}" controller_id="FollowPath1"/>
-            <BackUp backup_dist="0.20" backup_speed="0.05"/>
-            <Spin spin_dist="1.57"/>
-            <Sequence>
-              <ClearEntireCostmap name="ClearLocalCostmap-ToStart" service_name="local_costmap/clear_entirely_local_costmap"/>
-              <ClearEntireCostmap name="ClearGlobalCostmap-ToStart" service_name="global_costmap/clear_entirely_global_costmap"/>
-            </Sequence>
-            <Wait wait_duration="2.0"/>
-          </RoundRobin>
-        </RecoveryNode>
+        <FollowPath path="{path_to_start}" controller_id="FollowPath"/>
 
+        <!-- Follow entire coverage path with obstacle recovery -->
         <RecoveryNode number_of_retries="100">
+          <!-- PRIMARY: Follow coverage path with MPPI controller (has obstacle avoidance) -->
           <FollowPath path="{path}" controller_id="FollowPath"/>
+          
+          <!-- RECOVERY: If obstacles block path -->
           <RoundRobin>
+            <!-- Try following path with fallback controller -->
             <FollowPath path="{path}" controller_id="FollowPath1"/>
-            <BackUp backup_dist="0.20" backup_speed="0.05"/>
-            <Spin spin_dist="1.57"/>
+            <!-- Back up and clear costmaps -->
             <Sequence>
+              <BackUp backup_dist="0.25" backup_speed="0.05"/>
               <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
               <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
             </Sequence>
-            <Wait wait_duration="2.0"/>
+            <!-- Wait for costmap to update -->
+            <Wait wait_duration="1.0"/>
           </RoundRobin>
         </RecoveryNode>
       </Sequence>
